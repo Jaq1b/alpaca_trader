@@ -1,0 +1,21 @@
+[tool.black]
+line-length = 88
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+
+[tool.ruff.lint]
+# Keep lint focused on real defects; timezone/style nits are deliberate local-time usage.
+select = ["E4", "E7", "E9", "F", "I", "UP", "RUF013"]
+ignore = [
+  "E501",    # line length handled by black
+  "UP007",   # Optional[X] vs X | None — mixed styles fine here
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["F401"]
+# load_env / sys.path must run before package imports
+"backtest.py" = ["E402"]
+"scripts/report.py" = ["E402"]
