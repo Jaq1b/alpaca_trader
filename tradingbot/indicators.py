@@ -1,6 +1,5 @@
 """SMA, EMA, RSI, MACD, and ATR — building blocks for signal scoring."""
 
-
 import pandas as pd
 
 

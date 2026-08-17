@@ -56,7 +56,7 @@ class Order:
     order_type: OrderType
     quantity: float
     price: float | None = None
-    timestamp: datetime = None
+    timestamp: datetime | None = None
     status: OrderStatus = OrderStatus.PENDING
     order_id: str | None = None
     asset_class: str = "stock"

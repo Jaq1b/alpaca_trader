@@ -24,7 +24,7 @@ class TradeMemory:
         self._conn.row_factory = sqlite3.Row
         self._init_db()
         self._maybe_migrate_json()
-        logger.info(f"Trade memory initialized: {self.db_path}")
+        logger.debug("ledger %s", self.db_path)
 
     def _init_db(self):
         cur = self._conn.cursor()
@@ -264,9 +264,14 @@ class TradeMemory:
             ),
         )
         self._conn.commit()
-        logger.info(
-            f"EVENT {event_type} | {symbol} | price={price} | "
-            f"pnl={pnl} R={r_multiple} | {reason}"
+        logger.debug(
+            "event %s %s price=%s pnl=%s R=%s %s",
+            event_type,
+            symbol,
+            price,
+            pnl,
+            r_multiple,
+            reason,
         )
 
     def get_open_trades(self) -> dict[str, tuple[Trade, str]]:
@@ -277,15 +282,6 @@ class TradeMemory:
             trade = self._row_to_trade(row)
             open_trades[trade.symbol] = (trade, row["trade_id"])
         return open_trades
-
-    def get_trade_history(self, days: int = 30) -> list[Trade]:
-        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-        cur = self._conn.cursor()
-        cur.execute(
-            "SELECT * FROM trades WHERE substr(timestamp, 1, 10) >= ? ORDER BY timestamp DESC",
-            (cutoff,),
-        )
-        return [self._row_to_trade(row) for row in cur.fetchall()]
 
     def get_closed_trades(self, days: int | None = None) -> list[Trade]:
         """Closed trades only. Pass days=None for full ledger history."""
@@ -305,11 +301,6 @@ class TradeMemory:
                 (cutoff,),
             )
         return [self._row_to_trade(row) for row in cur.fetchall()]
-
-    def get_all_trades(self) -> list[tuple[Trade, str]]:
-        cur = self._conn.cursor()
-        cur.execute("SELECT * FROM trades ORDER BY timestamp ASC")
-        return [(self._row_to_trade(row), row["trade_id"]) for row in cur.fetchall()]
 
     def get_bot_state(self) -> dict:
         cur = self._conn.cursor()
@@ -351,11 +342,3 @@ class TradeMemory:
             (symbol, since),
         )
         return [self._row_to_trade(row) for row in cur.fetchall()]
-
-    def get_events(self, limit: int = 100) -> list[dict]:
-        cur = self._conn.cursor()
-        cur.execute(
-            "SELECT * FROM trade_events ORDER BY id DESC LIMIT ?",
-            (limit,),
-        )
-        return [dict(row) for row in cur.fetchall()]

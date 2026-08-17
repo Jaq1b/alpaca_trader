@@ -9,7 +9,9 @@ from typing import Any
 
 import pandas as pd
 
+from tradingbot.sizing import quantity_for_risk, unrealized_pnl
 from tradingbot.strategy import SignalStrategy
+from tradingbot.universe import PRIORITY_SYMBOLS
 
 logger = logging.getLogger(__name__)
 
@@ -64,19 +66,14 @@ class BacktestResult:
     def summary(self) -> str:
         return "\n".join(
             [
-                "=" * 50,
-                "BACKTEST RESULTS",
-                "=" * 50,
-                f"Capital: ${self.initial_capital:,.2f} -> ${self.ending_capital:,.2f}",
-                f"Total P&L: ${self.total_pnl:,.2f}",
-                f"Trades: {self.total_trades} | Wins: {self.winning_trades} | "
-                f"Losses: {self.losing_trades}",
-                f"Win rate: {self.win_rate:.1%}",
-                f"Avg P&L / trade: ${self.avg_pnl:,.2f}",
-                f"Avg R-multiple: {self.avg_r:.2f}",
-                f"Max drawdown: {self.max_drawdown:.1%}",
-                f"Trades / day: {self.trades_per_day:.2f}",
-                "=" * 50,
+                "Backtest",
+                f"  capital     ${self.initial_capital:,.2f} → ${self.ending_capital:,.2f}",
+                f"  P&L         ${self.total_pnl:,.2f}",
+                f"  trades      {self.total_trades}  "
+                f"wins {self.winning_trades}  losses {self.losing_trades}",
+                f"  win rate    {self.win_rate:.1%}",
+                f"  avg P&L     ${self.avg_pnl:,.2f}  avg R {self.avg_r:.2f}",
+                f"  max DD      {self.max_drawdown:.1%}  trades/day {self.trades_per_day:.2f}",
             ]
         )
 
@@ -101,14 +98,22 @@ class Backtester:
         self.bar_limit = int(bt.get("bar_limit", 5000))
         self.risk_cfg = config.get("risk", {})
         self.strategy_cfg = config.get("strategy", {})
-        self.stock_symbols = list(config.get("symbols", {}).get("stocks", []))
+        stocks_cfg = config.get("symbols", {}).get("stocks", "watchlist")
+        if isinstance(stocks_cfg, str) and stocks_cfg.strip().lower() == "watchlist":
+            self.stock_symbols = list(PRIORITY_SYMBOLS)
+        elif isinstance(stocks_cfg, list):
+            self.stock_symbols = [str(s).upper() for s in stocks_cfg]
+        else:
+            self.stock_symbols = list(PRIORITY_SYMBOLS)
         self.crypto_symbols = list(config.get("symbols", {}).get("crypto", []))
         self.symbols = self.stock_symbols + self.crypto_symbols
-        self.risk_per_trade = float(self.risk_cfg.get("stock_per_trade", 0.012))
-        self.max_positions = int(self.risk_cfg.get("max_positions", 6))
+        self.stock_risk = float(self.risk_cfg.get("stock_per_trade", 0.008))
+        self.crypto_risk = float(self.risk_cfg.get("crypto_per_trade", 0.006))
+        self.max_positions = int(self.risk_cfg.get("max_positions", 0))
         self.min_hold_bars = max(
-            1, int(self.risk_cfg.get("min_hold_seconds", 180) / 300)
+            1, int(self.risk_cfg.get("min_hold_seconds", 300) / 300)
         )
+        self.min_position_value = float(self.risk_cfg.get("min_position_value", 250.0))
         self.atr_trail_mult = float(self.strategy_cfg.get("atr_trail_mult", 2.0))
         self.trail_arm_atr_mult = float(
             self.strategy_cfg.get("trail_arm_atr_mult", 1.5)
@@ -135,9 +140,13 @@ class Backtester:
             )
             if df is not None and not df.empty:
                 history[symbol] = df.sort_index()
-                logger.info(f"Loaded {len(df)} bars for {symbol}")
             else:
                 logger.warning(f"No history for {symbol}")
+        if history:
+            logger.info(
+                f"Backtest data  {len(history)} symbols  "
+                f"{sum(len(df) for df in history.values())} bars"
+            )
         return history
 
     def run(self) -> BacktestResult:
@@ -268,18 +277,18 @@ class Backtester:
                                 cash += pos["entry_price"] * pos["quantity"]
                     continue
 
-                # Entries
-                if len(open_positions) >= self.max_positions:
+                # Entries (max_positions <= 0 means no slot cap)
+                if self.max_positions > 0 and len(open_positions) >= self.max_positions:
                     continue
 
-                should_buy, reason, stop_loss, atr = strategy.should_buy(
+                should_buy, reason, stop_loss, atr, score = strategy.should_buy(
                     window_df, symbol, asset_class
                 )
                 side = "long"
                 if not should_buy or stop_loss <= 0:
                     if not (self.allow_shorting and asset_class == "stock"):
                         continue
-                    should_short, reason, stop_loss, atr = strategy.should_short(
+                    should_short, reason, stop_loss, atr, score = strategy.should_short(
                         window_df, symbol, asset_class
                     )
                     if not should_short or stop_loss <= 0:
@@ -290,16 +299,25 @@ class Backtester:
                 if stop_distance <= 0:
                     continue
 
-                risk_amount = cash * self.risk_per_trade
-                qty = risk_amount / stop_distance
                 max_val = (
-                    self.risk_cfg.get("max_position_value_crypto", 200)
+                    self.risk_cfg.get("max_position_value_crypto", 5000)
                     if asset_class == "crypto"
-                    else self.risk_cfg.get("max_position_value_stock", 300)
+                    else self.risk_cfg.get("max_position_value_stock", 10000)
                 )
-                qty = min(qty, max_val / price)
-                if asset_class != "crypto":
-                    qty = max(1, int(qty))
+                risk_frac = (
+                    self.crypto_risk if asset_class == "crypto" else self.stock_risk
+                )
+                qty = quantity_for_risk(
+                    equity=cash,
+                    risk_per_trade=risk_frac,
+                    entry_price=price,
+                    stop_loss=stop_loss,
+                    asset_class=asset_class,
+                    score=score,
+                    score_min=strategy.entry_score_min(asset_class),
+                    max_position_value=float(max_val),
+                    min_position_value=self.min_position_value,
+                )
                 cost = qty * price
                 if qty <= 0 or cost > cash:
                     continue
@@ -374,12 +392,9 @@ class Backtester:
         memory: InMemoryTradeStore,
     ):
         side = pos.get("side", "long")
-        if side == "short":
-            pnl = (pos["entry_price"] - exit_price) * pos["quantity"]
-            pnl_pct = (pos["entry_price"] - exit_price) / pos["entry_price"] * 100
-        else:
-            pnl = (exit_price - pos["entry_price"]) * pos["quantity"]
-            pnl_pct = (exit_price - pos["entry_price"]) / pos["entry_price"] * 100
+        pnl, pnl_pct = unrealized_pnl(
+            pos["entry_price"], exit_price, pos["quantity"], side
+        )
         initial_risk = pos.get("initial_risk") or 0.0
         r_multiple = (pnl / initial_risk) if initial_risk > 0 else None
         trade = {

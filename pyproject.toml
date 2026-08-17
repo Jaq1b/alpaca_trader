@@ -1,3 +1,11 @@
+[project]
+name = "tradingbottest"
+version = "1.0.0"
+description = "Alpaca paper-trading bot for US equities and crypto"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
 [tool.black]
 line-length = 88
 target-version = ["py310"]

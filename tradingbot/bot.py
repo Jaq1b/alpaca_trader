@@ -11,10 +11,39 @@ from tradingbot.config import load_config
 from tradingbot.market_hours import MarketHours
 from tradingbot.memory import TradeMemory
 from tradingbot.models import Order, OrderType, Trade
+from tradingbot.sizing import quantity_for_risk, unrealized_pnl
 from tradingbot.strategy import SignalStrategy
 from tradingbot.universe import PRIORITY_SYMBOLS
 
 logger = logging.getLogger(__name__)
+
+
+def _qty_str(qty: float, asset_class: str) -> str:
+    if asset_class == "crypto":
+        return f"{qty:.6g}"
+    rounded = round(qty)
+    if abs(qty - rounded) < 1e-6:
+        return str(int(rounded))
+    return f"{qty:.2f}"
+
+
+def _brief_reason(reason: str) -> str:
+    text = reason or ""
+    for prefix in ("BUY: ", "SHORT: ", "SELL: ", "COVER: "):
+        if text.startswith(prefix):
+            return text[len(prefix) :]
+    return text
+
+
+def _hold_str(delta) -> str:
+    secs = max(0, int(delta.total_seconds()))
+    if secs < 60:
+        return f"{secs}s"
+    mins, rem = divmod(secs, 60)
+    if mins < 60:
+        return f"{mins}m" if rem < 10 else f"{mins}m{rem:02d}s"
+    hours, mins = divmod(mins, 60)
+    return f"{hours}h{mins:02d}m"
 
 
 class TradingBot:
@@ -36,9 +65,7 @@ class TradingBot:
         symbols_cfg = self.config.get("symbols", {})
         strategy_cfg = self.config.get("strategy", {})
 
-        self.daily_crypto_limit = float(risk.get("daily_crypto_limit", 2500.0))
-        self.daily_stock_limit = float(risk.get("daily_stock_limit", 5000.0))
-        self.scan_batch_size = int(symbols_cfg.get("scan_batch_size", 40))
+        self.scan_batch_size = int(symbols_cfg.get("scan_batch_size", 100))
         self._scan_offset = 0
 
         self.stock_symbols = self._resolve_stock_symbols(symbols_cfg.get("stocks"))
@@ -49,18 +76,20 @@ class TradingBot:
         self.strategy = SignalStrategy(self.memory, strategy_cfg)
 
         self.check_interval = int(risk.get("check_interval_seconds", 45))
-        self.max_positions = int(risk.get("max_positions", 6))
-        self.min_hold_time = int(risk.get("min_hold_seconds", 180))
-        self.crypto_risk_per_trade = float(risk.get("crypto_per_trade", 0.012))
-        self.stock_risk_per_trade = float(risk.get("stock_per_trade", 0.012))
+        # 0 = unlimited; per-trade max notional + equity gate deployment.
+        self.max_positions = int(risk.get("max_positions", 0))
+        self.min_hold_time = int(risk.get("min_hold_seconds", 300))
+        self.crypto_risk_per_trade = float(risk.get("crypto_per_trade", 0.006))
+        self.stock_risk_per_trade = float(risk.get("stock_per_trade", 0.008))
         self.max_position_value_crypto = float(
-            risk.get("max_position_value_crypto", 200.0)
+            risk.get("max_position_value_crypto", 2000.0)
         )
         self.max_position_value_stock = float(
-            risk.get("max_position_value_stock", 300.0)
+            risk.get("max_position_value_stock", 4000.0)
         )
-        self.min_position_value = float(risk.get("min_position_value", 15.0))
+        self.min_position_value = float(risk.get("min_position_value", 250.0))
         self.allow_shorting = bool(risk.get("allow_shorting", True))
+        self.min_bars = int(strategy_cfg.get("min_bars", 40))
 
         self.atr_trail_mult = float(strategy_cfg.get("atr_trail_mult", 2.0))
         self.trail_arm_atr_mult = float(strategy_cfg.get("trail_arm_atr_mult", 1.5))
@@ -73,20 +102,24 @@ class TradingBot:
         self.total_trades = bot_state.get("total_trades", 0) or 0
         self.winning_trades = bot_state.get("winning_trades", 0) or 0
 
-        logger.info("TRADING BOT INITIALIZED")
         scan_mode = (
-            "full scan every loop"
+            "full scan"
             if len(self.stock_symbols) <= self.scan_batch_size
             else f"rotate {self.scan_batch_size}/loop"
         )
         logger.info(
-            f"Watchlist: {len(self.stock_symbols)} stocks + "
-            f"{len(self.crypto_symbols)} crypto | {scan_mode}"
+            f"Ready  {len(self.stock_symbols)} stocks + "
+            f"{len(self.crypto_symbols)} crypto  "
+            f"{scan_mode}  every {self.check_interval}s"
         )
+        pos_cap = "unlimited" if self.max_positions <= 0 else str(self.max_positions)
         logger.info(
-            f"Daily limits: Crypto ${self.daily_crypto_limit:,.0f}, "
-            f"Stocks ${self.daily_stock_limit:,.0f} | max positions {self.max_positions} | "
-            f"shorting={'ON' if self.allow_shorting else 'OFF'} (stocks only)"
+            f"Risk  stock {self.stock_risk_per_trade:.1%} / "
+            f"crypto {self.crypto_risk_per_trade:.1%} of equity  "
+            f"max ${self.max_position_value_stock:,.0f} / "
+            f"${self.max_position_value_crypto:,.0f}  "
+            f"slots {pos_cap}  "
+            f"shorting={'on' if self.allow_shorting else 'off'}"
         )
 
     def _resolve_stock_symbols(self, stocks_cfg) -> list[str]:
@@ -151,133 +184,158 @@ class TradingBot:
             position.get("side") or getattr(position["trade"], "side", None) or "long"
         )
 
+    def _to_bot_symbol(self, alpaca_symbol: str) -> str:
+        """Map Alpaca BTCUSD → config BTC/USD when we know the pair."""
+        key = AlpacaBroker.normalize_symbol(alpaca_symbol)
+        for symbol in self.crypto_symbols:
+            if AlpacaBroker.normalize_symbol(symbol) == key:
+                return symbol
+        return str(alpaca_symbol).upper()
+
     def _restore_state(self):
-        memory_positions = self.memory.get_open_trades()
-        alpaca_positions = self.broker.get_positions(force=True)
-        alpaca_symbols = {
-            pos["symbol"]: pos for pos in alpaca_positions if float(pos["qty"]) != 0
+        """
+        Alpaca is the source of truth for open positions.
+
+        - Every non-dust Alpaca position becomes an active bot position.
+        - Ledger rows are attached when they match; otherwise we sync a new row.
+        - Ledger "open" rows with no Alpaca position are closed locally.
+        """
+        memory_open = self.memory.get_open_trades()
+        memory_by_key = {
+            AlpacaBroker.normalize_symbol(symbol): (symbol, trade, trade_id)
+            for symbol, (trade, trade_id) in memory_open.items()
         }
 
+        alpaca_positions = self.broker.get_positions(force=True)
         self.active_positions = {}
-        ghost_positions = []
-        restored_positions = []
+        synced: list[str] = []
+        closed_stale = 0
 
-        for symbol, (trade, trade_id) in memory_positions.items():
-            if symbol in alpaca_symbols:
-                alpaca_pos = alpaca_symbols[symbol]
-                signed_qty = float(alpaca_pos["qty"])
-                qty_abs = abs(signed_qty)
-                side = getattr(trade, "side", None) or (
-                    "short" if signed_qty < 0 else "long"
+        seen_keys: set[str] = set()
+        for alpaca_pos in alpaca_positions:
+            if float(alpaca_pos.get("qty") or 0) == 0:
+                continue
+            if AlpacaBroker.is_dust_position(alpaca_pos):
+                logger.debug(
+                    "ignore dust %s qty=%s",
+                    alpaca_pos.get("symbol"),
+                    alpaca_pos.get("qty"),
                 )
+                continue
+
+            key = AlpacaBroker.normalize_symbol(alpaca_pos["symbol"])
+            seen_keys.add(key)
+            symbol = self._to_bot_symbol(alpaca_pos["symbol"])
+            signed_qty = float(alpaca_pos["qty"])
+            qty_abs = abs(signed_qty)
+            side = "short" if signed_qty < 0 else "long"
+            entry = float(alpaca_pos.get("avg_entry_price") or 0) or float(
+                alpaca_pos.get("current_price") or 0
+            )
+            if entry <= 0:
+                continue
+
+            if key in memory_by_key:
+                _sym, trade, trade_id = memory_by_key[key]
+                symbol = _sym  # keep config/ledger symbol (BTC/USD)
                 trade.side = side
-
-                if self._get_asset_class(symbol) == "crypto":
-                    if abs(qty_abs - abs(trade.quantity or 0)) > 0.0001:
-                        logger.info(
-                            f"Updating {symbol} quantity: {trade.quantity:.6f} -> {qty_abs:.6f}"
-                        )
-                        trade.quantity = qty_abs
-                        trade.actual_quantity = qty_abs
-                        self.memory.update_trade(trade, trade_id)
-                elif abs(qty_abs - abs(trade.quantity or 0)) > 0.0001:
-                    trade.quantity = qty_abs
-                    trade.actual_quantity = qty_abs
-                    self.memory.update_trade(trade, trade_id)
-
-                risk_dist = abs(trade.entry_price - trade.stop_loss)
-                self.active_positions[symbol] = {
-                    "trade": trade,
-                    "trade_id": trade_id,
-                    "quantity": qty_abs,
-                    "entry_price": trade.entry_price,
-                    "stop_loss": trade.stop_loss,
-                    "timestamp": datetime.fromisoformat(trade.timestamp),
-                    "asset_class": trade.asset_class,
-                    "atr": trade.atr_at_entry or 0.0,
-                    "initial_risk": trade.initial_risk or risk_dist * qty_abs,
-                    "side": side,
-                }
-                restored_positions.append(f"{symbol}({side})")
+                trade.quantity = qty_abs
+                trade.actual_quantity = qty_abs
+                trade.entry_price = entry
+                trade.status = "open"
+                self.memory.update_trade(trade, trade_id)
+                source = "ledger+alpaca"
             else:
-                ghost_positions.append((symbol, trade, trade_id))
+                asset_class = self._get_asset_class(symbol)
+                stop = entry * (0.97 if side == "long" else 1.03)
+                trade = Trade(
+                    symbol=symbol,
+                    entry_price=entry,
+                    quantity=qty_abs,
+                    timestamp=datetime.now().isoformat(),
+                    stop_loss=stop,
+                    asset_class=asset_class,
+                    status="open",
+                    strategy_signals="Synced from Alpaca",
+                    actual_quantity=qty_abs,
+                    initial_risk=abs(entry - stop) * qty_abs,
+                    atr_at_entry=0.0,
+                    side=side,
+                    fees=0.0,
+                )
+                trade_id = self.memory.save_trade(trade)
+                source = "alpaca-only"
 
-        for symbol, trade, trade_id in ghost_positions:
+            risk_dist = abs(trade.entry_price - trade.stop_loss)
+            self.active_positions[symbol] = {
+                "trade": trade,
+                "trade_id": trade_id,
+                "quantity": qty_abs,
+                "entry_price": trade.entry_price,
+                "stop_loss": trade.stop_loss,
+                "timestamp": datetime.fromisoformat(trade.timestamp),
+                "asset_class": trade.asset_class,
+                "atr": trade.atr_at_entry or 0.0,
+                "initial_risk": trade.initial_risk or risk_dist * qty_abs,
+                "side": side,
+            }
+            synced.append(f"{symbol}({side},{source})")
+
+        # Ledger opens that Alpaca does not hold → close locally (Alpaca wins).
+        for key, (symbol, trade, trade_id) in memory_by_key.items():
+            if key in seen_keys:
+                continue
             trade.exit_price = trade.entry_price
             trade.exit_timestamp = datetime.now().isoformat()
             trade.status = "closed"
             trade.pnl = 0.0
             trade.pnl_pct = 0.0
-            trade.exit_reason = "Position not found - auto-closed"
+            trade.exit_reason = "Closed — not on Alpaca"
             self.memory.update_trade(trade, trade_id)
+            closed_stale += 1
 
         logger.info(
-            f"Restored {len(restored_positions)} positions, cleaned {len(ghost_positions)} ghosts"
+            f"Sync  {len(synced)} open on Alpaca"
+            + (f", closed {closed_stale} stale ledger row(s)" if closed_stale else "")
         )
-        if restored_positions:
-            logger.info(f"Active positions: {', '.join(restored_positions)}")
-
-    def get_daily_spending(self, asset_class: str) -> float:
-        today = datetime.now().strftime("%Y-%m-%d")
-        daily_spending = 0.0
-        for trade in self.memory.get_trade_history(days=1):
-            if not trade.timestamp:
-                continue
-            trade_date = trade.timestamp[:10]
-            if (
-                trade_date == today
-                and trade.asset_class == asset_class
-                and trade.status in ("open", "closed")
-            ):
-                daily_spending += trade.entry_price * abs(trade.quantity)
-        return daily_spending
+        if synced:
+            logger.info("Open  " + ", ".join(synced))
 
     def calculate_position_size(
-        self, symbol: str, entry_price: float, stop_loss: float, asset_class: str
+        self,
+        symbol: str,
+        entry_price: float,
+        stop_loss: float,
+        asset_class: str,
+        score: int = 0,
     ) -> float:
         account = self.broker.get_account()
-        buying_power = float(account.get("buying_power", self.initial_capital))
-
-        risk_per_trade = (
+        equity = float(
+            account.get("equity")
+            or account.get("portfolio_value")
+            or self.initial_capital
+        )
+        max_val = (
+            self.max_position_value_crypto
+            if asset_class == "crypto"
+            else self.max_position_value_stock
+        )
+        risk_frac = (
             self.crypto_risk_per_trade
             if asset_class == "crypto"
             else self.stock_risk_per_trade
         )
-        risk_amount = buying_power * risk_per_trade
-
-        stop_distance = abs(entry_price - stop_loss)
-        if stop_distance <= 0:
-            return 0
-
-        position_size = risk_amount / stop_distance
-
-        daily_spending = self.get_daily_spending(asset_class)
-        daily_limit = (
-            self.daily_crypto_limit
-            if asset_class == "crypto"
-            else self.daily_stock_limit
+        return quantity_for_risk(
+            equity=equity,
+            risk_per_trade=risk_frac,
+            entry_price=entry_price,
+            stop_loss=stop_loss,
+            asset_class=asset_class,
+            score=score,
+            score_min=self.strategy.entry_score_min(asset_class),
+            max_position_value=max_val,
+            min_position_value=self.min_position_value,
         )
-        remaining_budget = daily_limit - daily_spending
-        if remaining_budget < 20:
-            return 0
-
-        position_value = position_size * entry_price
-        if position_value > remaining_budget:
-            position_size = remaining_budget / entry_price
-
-        if asset_class == "crypto":
-            min_shares = self.min_position_value / entry_price
-            position_size = max(position_size, min_shares)
-            position_size = min(
-                position_size, self.max_position_value_crypto / entry_price
-            )
-        else:
-            position_size = max(1, int(position_size))
-            position_size = min(
-                position_size, int(self.max_position_value_stock / entry_price) or 1
-            )
-
-        return position_size
 
     def execute_open(
         self,
@@ -287,10 +345,11 @@ class TradingBot:
         reason: str,
         atr: float = 0.0,
         side: str = "long",
+        score: int = 0,
     ):
         """Open a long (BUY) or short (SELL) stock/crypto position."""
         side = "short" if side == "short" else "long"
-        if len(self.active_positions) >= self.max_positions:
+        if self.max_positions > 0 and len(self.active_positions) >= self.max_positions:
             return False
 
         asset_class = self._get_asset_class(symbol)
@@ -304,17 +363,16 @@ class TradingBot:
         if asset_class == "stock" and not self.market_hours.is_stock_market_open():
             return False
 
-        daily_spending = self.get_daily_spending(asset_class)
-        daily_limit = (
-            self.daily_crypto_limit
-            if asset_class == "crypto"
-            else self.daily_stock_limit
-        )
-        if daily_spending >= daily_limit:
+        # Broker already holds this name (ledger miss / symbol mismatch recovery).
+        existing = self.broker.find_position(symbol, force=True)
+        if existing is not None and not AlpacaBroker.is_dust_position(existing):
+            logger.warning(
+                f"Skip {symbol} — Alpaca already holds {existing.get('qty')}"
+            )
             return False
 
         position_size = self.calculate_position_size(
-            symbol, current_price, stop_loss, asset_class
+            symbol, current_price, stop_loss, asset_class, score=score
         )
         if position_size <= 0:
             return False
@@ -330,8 +388,9 @@ class TradingBot:
         initial_risk = abs(current_price - stop_loss) * position_size
         action = "BUY" if side == "long" else "SHORT"
         logger.info(
-            f"{action} {symbol}: {position_size:.4f} @ ${current_price:.2f} | "
-            f"stop ${stop_loss:.2f} (ATR {atr:.4f}) | risk ${initial_risk:.2f} | {reason}"
+            f"{action}  {symbol}  {_qty_str(position_size, asset_class)} "
+            f"@ ${current_price:.2f}  stop ${stop_loss:.2f}  "
+            f"risk ${initial_risk:.0f}  {_brief_reason(reason)}"
         )
 
         if self.broker.place_order(order):
@@ -397,9 +456,7 @@ class TradingBot:
         signed_qty = self.broker.get_actual_position_quantity(symbol)
         expected_sign = -1 if side == "short" else 1
         if signed_qty == 0 or (signed_qty > 0) != (expected_sign > 0):
-            logger.warning(
-                f"No matching {side} {symbol} position in Alpaca, cleaning up memory"
-            )
+            logger.warning(f"{symbol} gone on Alpaca — dropped from ledger")
             trade = position["trade"]
             trade.exit_price = current_price
             trade.exit_timestamp = datetime.now().isoformat()
@@ -412,52 +469,54 @@ class TradingBot:
             return False
 
         close_quantity = abs(signed_qty)
-        # Closing a long = sell; covering a short = buy
+        # Closing a long = sell; covering a short = buy.
+        # Crypto exits must use qty (not notional) so we never oversell.
         order_type = OrderType.SELL if side == "long" else OrderType.BUY
-        if (
-            asset_class == "crypto"
-            and side == "long"
-            and close_quantity * current_price < 1.0
-        ):
-            order = Order(
-                symbol=symbol,
-                order_type=order_type,
-                quantity=close_quantity,
-                notional=close_quantity * current_price,
-                asset_class=asset_class,
-            )
-        else:
-            order = Order(
-                symbol=symbol,
-                order_type=order_type,
-                quantity=close_quantity,
-                asset_class=asset_class,
-            )
+        order = Order(
+            symbol=symbol,
+            order_type=order_type,
+            quantity=close_quantity,
+            asset_class=asset_class,
+        )
 
-        if side == "long":
-            pnl = (current_price - position["entry_price"]) * close_quantity
-            pnl_pct = (
-                (current_price - position["entry_price"])
-                / position["entry_price"]
-                * 100
-            )
-        else:
-            pnl = (position["entry_price"] - current_price) * close_quantity
-            pnl_pct = (
-                (position["entry_price"] - current_price)
-                / position["entry_price"]
-                * 100
-            )
+        pnl, pnl_pct = unrealized_pnl(
+            position["entry_price"], current_price, close_quantity, side
+        )
         initial_risk = position.get("initial_risk") or 0.0
         r_multiple = (pnl / initial_risk) if initial_risk > 0 else None
 
-        action = "SELL" if side == "long" else "COVER"
+        if reason.lower() == "stop loss":
+            action = "STOP"
+        else:
+            action = "SELL" if side == "long" else "COVER"
+        r_txt = f"{r_multiple:.2f}" if r_multiple is not None else "n/a"
         logger.info(
-            f"{action} {symbol}: {close_quantity:.6f} @ ${current_price:.2f} | "
-            f"P&L: ${pnl:.2f} ({pnl_pct:.1f}%) R={r_multiple if r_multiple is not None else 'n/a'} | {reason}"
+            f"{action}  {symbol}  {_qty_str(close_quantity, asset_class)} "
+            f"@ ${current_price:.2f}  P&L ${pnl:.2f} ({pnl_pct:+.1f}%)  "
+            f"R={r_txt}  {_brief_reason(reason)}"
         )
 
         if self.broker.place_order(order):
+            # Crypto fills can leave sub-cent dust; try one exact sweep, then ignore.
+            if asset_class == "crypto" and side == "long":
+                self.broker.cache.invalidate("positions")
+                leftover = self.broker.find_position(symbol, force=True)
+                if leftover and not AlpacaBroker.is_dust_position(leftover):
+                    logger.warning(f"Sweep leftover {symbol} qty={leftover.get('qty')}")
+                    sweep = Order(
+                        symbol=symbol,
+                        order_type=OrderType.SELL,
+                        quantity=abs(float(leftover["qty"])),
+                        asset_class="crypto",
+                    )
+                    self.broker.place_order(sweep)
+                elif leftover and AlpacaBroker.is_dust_position(leftover):
+                    logger.debug(
+                        "dust left %s qty=%s",
+                        leftover.get("qty"),
+                        leftover.get("market_value"),
+                    )
+
             trade = position["trade"]
             trade.exit_price = current_price
             trade.exit_timestamp = datetime.now().isoformat()
@@ -512,10 +571,6 @@ class TradingBot:
                     current_price <= stop if side == "long" else current_price >= stop
                 )
                 if stopped:
-                    logger.warning(
-                        f"STOP LOSS ({side}): {symbol} @ ${current_price:.2f} "
-                        f"(stop ${stop:.2f})"
-                    )
                     self.execute_close(symbol, "Stop loss")
                     continue
 
@@ -532,40 +587,27 @@ class TradingBot:
 
                 if side == "long":
                     profit = current_price - position["entry_price"]
-                    if profit >= self.trail_arm_atr_mult * atr_value:
-                        new_stop = current_price - (self.atr_trail_mult * atr_value)
-                        if new_stop > position["stop_loss"]:
-                            position["stop_loss"] = new_stop
-                            trade = position["trade"]
-                            trade.stop_loss = new_stop
-                            self.memory.update_trade(trade, position["trade_id"])
-                            self.memory.log_event(
-                                trade_id=position["trade_id"],
-                                event_type="trail_update",
-                                symbol=symbol,
-                                price=current_price,
-                                stop_loss=new_stop,
-                                reason=f"ATR trail armed (+{profit / atr_value:.1f} ATR)",
-                                details={"atr": atr_value, "side": side},
-                            )
+                    new_stop = current_price - (self.atr_trail_mult * atr_value)
+                    improved = new_stop > position["stop_loss"]
                 else:
                     profit = position["entry_price"] - current_price
-                    if profit >= self.trail_arm_atr_mult * atr_value:
-                        new_stop = current_price + (self.atr_trail_mult * atr_value)
-                        if new_stop < position["stop_loss"]:
-                            position["stop_loss"] = new_stop
-                            trade = position["trade"]
-                            trade.stop_loss = new_stop
-                            self.memory.update_trade(trade, position["trade_id"])
-                            self.memory.log_event(
-                                trade_id=position["trade_id"],
-                                event_type="trail_update",
-                                symbol=symbol,
-                                price=current_price,
-                                stop_loss=new_stop,
-                                reason=f"ATR trail armed (+{profit / atr_value:.1f} ATR)",
-                                details={"atr": atr_value, "side": side},
-                            )
+                    new_stop = current_price + (self.atr_trail_mult * atr_value)
+                    improved = new_stop < position["stop_loss"]
+
+                if profit >= self.trail_arm_atr_mult * atr_value and improved:
+                    position["stop_loss"] = new_stop
+                    trade = position["trade"]
+                    trade.stop_loss = new_stop
+                    self.memory.update_trade(trade, position["trade_id"])
+                    self.memory.log_event(
+                        trade_id=position["trade_id"],
+                        event_type="trail_update",
+                        symbol=symbol,
+                        price=current_price,
+                        stop_loss=new_stop,
+                        reason=f"ATR trail armed (+{profit / atr_value:.1f} ATR)",
+                        details={"atr": atr_value, "side": side},
+                    )
             except Exception as e:
                 logger.error(f"Error checking stop loss for {symbol}: {e}")
 
@@ -574,6 +616,19 @@ class TradingBot:
         symbols_to_scan = self._symbols_for_this_scan(stock_market_open)
 
         bars_by_symbol = self.broker.get_bars_batch(symbols_to_scan, "5Min", 100)
+        stock_syms = [s for s in symbols_to_scan if self._get_asset_class(s) == "stock"]
+        if stock_syms:
+            usable = sum(
+                1
+                for s in stock_syms
+                if bars_by_symbol.get(s) is not None
+                and not bars_by_symbol[s].empty
+                and len(bars_by_symbol[s]) >= self.min_bars
+            )
+            if usable < max(1, len(stock_syms) // 2):
+                logger.warning(
+                    f"Bar coverage {usable}/{len(stock_syms)} — skipping most names"
+                )
         self.check_stop_losses(bars_by_symbol)
 
         for symbol in symbols_to_scan:
@@ -584,7 +639,9 @@ class TradingBot:
                     continue
 
                 has_position = symbol in self.active_positions
-                min_bars = 40 if not has_position else 20
+                min_bars = (
+                    self.min_bars if not has_position else max(20, self.min_bars // 2)
+                )
                 if len(bars) < min_bars:
                     continue
 
@@ -593,7 +650,7 @@ class TradingBot:
                     continue
 
                 if not has_position:
-                    should_buy, buy_reason, stop_loss, atr_value = (
+                    should_buy, buy_reason, stop_loss, atr_value, buy_score = (
                         self.strategy.should_buy(bars, symbol, asset_class)
                     )
                     if should_buy:
@@ -604,13 +661,18 @@ class TradingBot:
                             buy_reason,
                             atr=atr_value,
                             side="long",
+                            score=buy_score,
                         )
                         continue
 
                     if self.allow_shorting and asset_class == "stock":
-                        should_short, short_reason, short_stop, short_atr = (
-                            self.strategy.should_short(bars, symbol, asset_class)
-                        )
+                        (
+                            should_short,
+                            short_reason,
+                            short_stop,
+                            short_atr,
+                            short_score,
+                        ) = self.strategy.should_short(bars, symbol, asset_class)
                         if should_short:
                             self.execute_open(
                                 symbol,
@@ -619,6 +681,7 @@ class TradingBot:
                                 short_reason,
                                 atr=short_atr,
                                 side="short",
+                                score=short_score,
                             )
                 else:
                     position = self.active_positions[symbol]
@@ -642,80 +705,36 @@ class TradingBot:
         win_rate = (
             self.winning_trades / self.total_trades if self.total_trades > 0 else 0
         )
-
-        stock_positions = {
-            k: v
-            for k, v in self.active_positions.items()
-            if v["asset_class"] == "stock"
-        }
-        crypto_positions = {
-            k: v
-            for k, v in self.active_positions.items()
-            if v["asset_class"] == "crypto"
-        }
-
-        logger.info("=" * 60)
-        logger.info(f"BOT STATUS - {datetime.now().strftime('%H:%M:%S')}")
-        logger.info(
-            f"Portfolio: ${portfolio_value:,.2f} | P&L: ${self.total_pnl:.2f} | "
-            f"Win Rate: {win_rate:.1%} ({self.winning_trades}/{self.total_trades})"
+        session = (
+            "stocks+crypto"
+            if self.market_hours.is_stock_market_open()
+            else "crypto-only"
         )
         logger.info(
-            f"Positions: {len(self.active_positions)}/{self.max_positions} | "
-            f"Stocks: {len(stock_positions)} | Crypto: {len(crypto_positions)}"
+            f"${portfolio_value:,.0f}  P&L ${self.total_pnl:,.2f}  "
+            f"win {win_rate:.0%} ({self.winning_trades}/{self.total_trades})  "
+            f"{len(self.active_positions)} open  {session}"
         )
-
-        for label, positions in (
-            ("STOCKS", stock_positions),
-            ("CRYPTO", crypto_positions),
-        ):
-            if not positions:
-                continue
-            logger.info(f"  {label}:")
-            for symbol, position in positions.items():
-                current_price = self.broker.get_current_price(symbol)
-                side = self._position_side(position)
-                qty = abs(
-                    self.broker.get_actual_position_quantity(symbol)
-                    if position["asset_class"] == "crypto"
-                    else position["quantity"]
-                )
-                if side == "long":
-                    unrealized_pnl = (current_price - position["entry_price"]) * qty
-                    pnl_pct = (
-                        (current_price - position["entry_price"])
-                        / position["entry_price"]
-                        * 100
-                    )
-                else:
-                    unrealized_pnl = (position["entry_price"] - current_price) * qty
-                    pnl_pct = (
-                        (position["entry_price"] - current_price)
-                        / position["entry_price"]
-                        * 100
-                    )
-                hold_time = datetime.now() - position["timestamp"]
-                qty_fmt = (
-                    f"{qty:.6f}"
-                    if position["asset_class"] == "crypto"
-                    else f"{qty:.0f}"
-                )
-                logger.info(
-                    f"    {symbol} [{side}]: {qty_fmt} @ ${position['entry_price']:.2f} | "
-                    f"Current: ${current_price:.2f} | P&L: ${unrealized_pnl:.2f} ({pnl_pct:.1f}%) | "
-                    f"Stop: ${position['stop_loss']:.2f} | Hold: {str(hold_time).split('.')[0]}"
-                )
-
-        logger.info("=" * 60)
+        for symbol, position in self.active_positions.items():
+            current_price = self.broker.get_current_price(symbol)
+            side = self._position_side(position)
+            qty = abs(
+                self.broker.get_actual_position_quantity(symbol)
+                if position["asset_class"] == "crypto"
+                else position["quantity"]
+            )
+            pnl, pnl_pct = unrealized_pnl(
+                position["entry_price"], current_price, qty, side
+            )
+            hold = _hold_str(datetime.now() - position["timestamp"])
+            logger.info(
+                f"  {symbol} {side} {_qty_str(qty, position['asset_class'])}  "
+                f"${position['entry_price']:.2f} → ${current_price:.2f}  "
+                f"${pnl:+.2f} ({pnl_pct:+.1f}%)  stop ${position['stop_loss']:.2f}  {hold}"
+            )
 
     def run(self):
-        logger.info("STARTING TRADING BOT")
-        logger.info(
-            f"ATR stops | long+short stocks | {self.max_positions} max positions | "
-            f"{self.check_interval}s intervals | Alpaca market data"
-        )
-
-        last_status_print = time.time()
+        last_status_print = 0.0
         try:
             while True:
                 start_time = time.time()
@@ -730,9 +749,8 @@ class TradingBot:
                 if sleep_time > 0:
                     time.sleep(sleep_time)
         except KeyboardInterrupt:
-            logger.info("Trading stopped by user")
+            logger.info("Stopped")
         except Exception as e:
-            logger.error(f"Fatal error: {e}")
+            logger.error(f"Fatal: {e}")
         finally:
             self.print_status()
-            logger.info("Bot shutdown complete")

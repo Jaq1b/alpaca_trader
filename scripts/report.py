@@ -28,7 +28,7 @@ from tradingbot.metrics import PerformanceAnalyzer, format_report, report_to_jso
 load_env(ROOT)
 
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s  %(message)s", datefmt="%H:%M:%S"
 )
 logger = logging.getLogger("report")
 
