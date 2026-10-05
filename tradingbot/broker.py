@@ -382,6 +382,68 @@ class AlpacaBroker:
             logger.debug(f"Bars failed for {symbol}: {e}")
             return pd.DataFrame()
 
+    def get_bars_range(
+        self,
+        symbol: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame:
+        """Every bar from start through end. Pages until Alpaca has no more."""
+        start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
+        end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        bars: list[dict] = []
+        token = None
+        truncated = False
+        # Crypto pages come back at about 2,000 bars, so a year of 5-minute
+        # data needs ~55 pages. 80 leaves room for the warmup week.
+        pages = 0
+        for _ in range(80):
+            pages += 1
+            if self._is_crypto(symbol):
+                params: dict = {
+                    "symbols": symbol,
+                    "timeframe": timeframe,
+                    "limit": 10000,
+                    "start": start_str,
+                    "end": end_str,
+                }
+                url = f"{self.data_url}/v1beta3/crypto/us/bars"
+            else:
+                params = {
+                    "timeframe": timeframe,
+                    "limit": 10000,
+                    "adjustment": "raw",
+                    "feed": "iex",
+                    "start": start_str,
+                    "end": end_str,
+                }
+                url = f"{self.data_url}/v2/stocks/{symbol}/bars"
+            if token:
+                params["page_token"] = token
+            data = self._get(url, params=params, timeout=60)
+            if self._is_crypto(symbol):
+                bars.extend((data.get("bars") or {}).get(symbol, []) or [])
+            else:
+                bars.extend(data.get("bars") or [])
+            token = data.get("next_page_token")
+            if not token:
+                break
+        else:
+            truncated = True
+        df = self._bars_to_df(bars)
+        if df.empty:
+            if truncated:
+                logger.warning(f"{symbol} history stopped after {pages} pages")
+            return df
+        df = df[~df.index.duplicated(keep="last")].sort_index()
+        if truncated:
+            logger.warning(
+                f"{symbol} history stopped after {pages} pages  "
+                f"{df.index.min()} → {df.index.max()}"
+            )
+        return df
+
     def get_bars_batch(
         self,
         symbols: list[str],

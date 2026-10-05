@@ -1,7 +1,7 @@
 [project]
-name = "tradingbottest"
+name = "alpaca-trader"
 version = "1.0.0"
-description = "Alpaca paper-trading bot for US equities and crypto"
+description = "Risk-first Alpaca trading bot: ATR-based sizing, broker-reconciled SQLite ledger, backtesting and performance reporting."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -24,6 +24,3 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["F401"]
-# load_env / sys.path must run before package imports
-"backtest.py" = ["E402"]
-"scripts/report.py" = ["E402"]

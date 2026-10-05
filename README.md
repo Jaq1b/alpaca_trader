@@ -1,223 +1,127 @@
-# tradingbottest
+# alpaca_trader
 
-Alpaca paper-trading bot for US equities and crypto. It scores RSI / MACD / SMA / volume setups, sizes from ATR stop distance, and keeps a SQLite ledger plus a performance report.
+Risk-first Alpaca trading bot: ATR-based sizing, broker-reconciled SQLite ledger, backtesting and performance reporting.
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
 [![Paper trading](https://img.shields.io/badge/default-paper%20trading-brightgreen.svg)](https://app.alpaca.markets/paper/dashboard/overview)
-[![Tests](https://img.shields.io/badge/tests-pytest-informational.svg)](tests/test_metrics.py)
+[![Tests](https://github.com/Jaq1b/alpaca_trader/actions/workflows/tests.yml/badge.svg)](https://github.com/Jaq1b/alpaca_trader/actions/workflows/tests.yml)
 
-> **Paper by default.** Live trading is opt-in and risks real money.
+On every start the bot reads live Alpaca positions and lines the SQLite ledger up with them. A ledger row the broker does not hold is closed at flat P&L. A position that exists only at Alpaca is recorded from the broker. Each new order is sized from the stop: account equity times a risk fraction times conviction, divided by the distance to an ATR stop. That stop is at least 0.8% of price for stocks and 1.5% for crypto, and at most 5% for stocks and 10% for crypto. The performance report prints closed P&L, win rate, and profit factor on their own, and marks Sharpe and Sortino unreliable until the sample covers 30 calendar days and 21 daily returns.
 
-## Table of contents
+Paper trading is the default. Live mode uses real money.
 
-- [Features](#features)
-- [Quick start](#quick-start)
-- [Usage](#usage)
-- [Configuration](#configuration)
-- [Architecture](#architecture)
-- [Design decisions](#design-decisions)
-- [Core concepts](#core-concepts)
-- [Project layout](#project-layout)
-- [Troubleshooting](#troubleshooting)
-- [Limitations](#limitations)
+## Results
 
-## Features
+**Backtest**, run 5 October 2026. Window 2025-10-01 to 2026-09-30, 5-minute bars, $10,000 starting cash. 86 symbols, 2,138,548 bars: the 81-name watchlist plus BTC, ETH, SOL, XRP, and DOGE.
 
-| Area | What it does |
-| --- | --- |
-| Markets | Curated liquid watchlist (full scan each loop) + BTC, ETH, SOL, XRP, DOGE |
-| Signals | RSI, MACD, SMA, volume — long and short stock setups; crypto long-only |
-| Risk | ATR stops with a minimum width, size from stop distance × conviction, per-trade max notional |
-| Execution | Long BUY / short SELL; cover with BUY |
-| Storage | SQLite trades + event log under `trading_data/` |
-| Metrics | Sharpe, Sortino, drawdown, win rate (`scripts/report.py`) |
-| Replay | Historical bar backtest (`python backtest.py`) |
+| Ending capital | Closed P&L | Win rate | Trades | Avg R | Max drawdown |
+| --- | --- | --- | --- | --- | --- |
+| $11,333.06 | +$1,333.06 | 36.3% (103 wins, 181 losses) | 284 | 0.10 | 8.0% |
+
+**Monte Carlo** of those 284 trades. 2,000 paths, seed 1. Each path draws the same trades again with replacement. It does not create new prices.
+
+| | p5 | p50 | p95 |
+| --- | --- | --- | --- |
+| Ending capital | $9,240.32 | $11,106.67 | $14,086.27 |
+| Max drawdown | | 5.3% | 11.2% |
+
+About one path in five finishes below $10,000 (20.8%). The historical path ended at $11,333.06, near the median. Fees and slippage are not modeled. A 36% win rate at +0.10R per trade is a thin result.
+
+The live paper account is not listed here. `python main.py report` prints closed P&L and open P&L from your own ledger. `--verbose` adds Sharpe, Sortino, and drawdown, and those ratios stay labeled unreliable until the window is long enough.
+
+## Demo
+
+From the repository root, with keys in `.env`:
+
+```bash
+python main.py status       # account, open book, recent closes
+python main.py report       # closed-trade results
+python main.py backtest     # replay bars, no orders
+python main.py montecarlo   # replay once, then resample those trades
+python main.py run          # scan and send paper orders until Ctrl+C
+```
+
+`status`, `report`, `backtest`, and `montecarlo` do not send orders. `python main.py` with no command is `run`.
+
+`status` during the US session prints `regular hours`. Outside that window it prints `equities closed, crypto open`. Stocks are scanned only while the equity session is open. Crypto (BTC, ETH, SOL, XRP, DOGE) still is.
+
+A fill is one line. This is the shape of the log, not a recorded trade:
+
+```text
+10:50:57  BUY  IBM  17 @ $229.68  stop $227.84  risk $31  RSI oversold, MACD bullish cross (Score: 6)
+```
 
 ## Quick start
 
-**Requirements:** Python 3.10+, free [Alpaca](https://alpaca.markets/) paper account.
-
-### 1. Clone and install
-
 ```bash
-git clone https://github.com/<your-user>/tradingbottest.git
-cd tradingbottest
-
+git clone https://github.com/Jaq1b/alpaca_trader.git
+cd alpaca_trader
 python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-```
-
-### 2. Add paper API keys
-
-Create keys in the [Paper Trading dashboard](https://app.alpaca.markets/paper/dashboard/overview) (keys usually start with `PK`).
-
-```bash
 cp .env.example .env
 ```
 
-Edit `.env` (use double quotes):
+Put paper keys in `.env` (they usually start with `PK`):
 
 ```env
 ALPACA_API_KEY="your_paper_key_here"
 ALPACA_SECRET_KEY="your_paper_secret_here"
 ```
 
-Do not commit `.env` or share your keys.
+```bash
+python main.py status
+```
 
-### 3. Run (paper)
+You should see equity, cash, and `Status ACTIVE`. Python 3.10 or newer. Keys come from the [paper dashboard](https://app.alpaca.markets/paper/dashboard/overview).
 
-`config.yaml` already sets `paper_trading: true`.
+`python main.py backtest` replays the same rules on downloaded bars and does not send orders. With no dates it uses the last `lookback_days` in `config.yaml` (30). To test a stretch you choose, pass the first and last day:
 
 ```bash
-python main.py
+python main.py backtest --start 2026-01-02 --end 2026-03-31
 ```
 
-Startup looks like:
+Dates are UTC calendar days. `--end` defaults to today, so `--start 2026-06-01` runs from that day through now. The same two dates can sit in `config.yaml` as `backtest.start` and `backtest.end`. Flags on the command override the file.
+
+The download starts a week before `--start` so RSI and ATR already have bars on the first session. Trades open only inside the dates you asked for. A long window on the full watchlist takes a while, because every symbol is downloaded for that span. To try one name, set `symbols.stocks` to a short list, run the backtest, then put `watchlist` back.
+
+`python main.py montecarlo` runs that same replay, then builds 2,000 equity curves by resampling the closed trades. It does not send orders and it does not invent new prices.
+
+```bash
+python main.py montecarlo --start 2026-01-02 --end 2026-03-31 --paths 2000 --seed 1
+```
+
+`pytest` runs the unit tests and does not call Alpaca.
+
+Settings, environment variables, and startup errors: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## Design
+
+- **Broker is the book.** Startup keeps ledger rows that match a live Alpaca position, records broker positions missing from the ledger, and flat-closes the rest.
+- **ATR sizing.** The stop is the wider of 2.5× ATR and a minimum percent (0.8% stocks, 1.5% crypto), and is capped at 5% of price for stocks and 10% for crypto. Names quieter than that minimum are skipped. After +1R the stop moves to entry. After +1.5R it trails 1R behind price. Quantity targets a fixed fraction of equity if that stop is hit, with a dollar cap.
+- **Honest ratios.** Closed P&L and open P&L are separate lines. Sharpe and Sortino are marked unreliable until 30 calendar days and 21 daily returns.
+- **One venue.** Bars and orders both come from Alpaca. Equities use IEX and the regular session. Crypto is long-only and trades around the clock.
+- **Score plus a strong signal.** Points from RSI, MACD, moving averages, and volume are not enough on their own. An entry also needs an RSI extreme, a MACD cross, or a moving-average cross.
+
+Longer notes, each with what was chosen and the trade-off: [docs/DESIGN.md](docs/DESIGN.md).
+
+## Layout
 
 ```text
-10:50:50  Alpaca paper  equity $10,000.00  ACTIVE
-10:50:50  Ready  81 stocks + 5 crypto  full scan  every 45s
-10:50:50  Risk  stock 0.8% / crypto 0.6% of equity  max $4,000 / $2,000  slots unlimited  shorting=on
+main.py        status, report, backtest, montecarlo, and run
+tradingbot/    broker, strategy, sizing, replay, and Monte Carlo
+tests/         pytest, with no Alpaca calls
+docs/          configuration and design notes
+config.yaml    risk, watchlist, and the backtest window
 ```
-
-Entries and exits are one line each. A compact book snapshot prints about every five minutes. Stop with `Ctrl+C`.
-
-Symbols and risk knobs load from `config.yaml` at startup — restart the bot after editing that file.
-
-## Usage
-
-| Command | Purpose |
-| --- | --- |
-| `python main.py` | Run the paper/live loop |
-| `python scripts/report.py` | Print metrics + write `trading_data/metrics_snapshot.json` |
-| `python scripts/report.py --no-alpaca` | Ledger-only report (no API) |
-| `python backtest.py` | Replay the strategy on historical bars |
-| `pytest tests/test_metrics.py -v` | Unit tests for Sharpe / Sortino / drawdown |
-
-## Configuration
-
-### Environment variables
-
-| Variable | Required | Description |
-| --- | --- | --- |
-| `ALPACA_API_KEY` | Yes | Alpaca key id |
-| `ALPACA_SECRET_KEY` | Yes | Alpaca secret |
-| `ALPACA_PAPER_TRADING` | No | Overrides `config.yaml` (`true` / `false`) |
-| `TRADING_CONFIG` | No | Path to YAML (default: `config.yaml`) |
-| `TRADING_DATA_DIR` | No | Data directory (default: `trading_data`) |
-
-### `config.yaml`
-
-| Key | Purpose |
-| --- | --- |
-| `symbols.stocks` | Ticker list, `watchlist`, `top_N`, or `all` |
-| `symbols.scan_batch_size` | Max stocks per loop (keep ≥ watchlist size for full coverage) |
-| `symbols.crypto` | Crypto pairs (`BTC/USD`, …) |
-| `risk.*` | Equity risk per trade, max notional, max positions, `allow_shorting` |
-| `strategy.*` | Signal thresholds, ATR / min-stop, cooldowns |
-| `paper_trading` | `true` = paper API; `false` = live (real money) |
-
-**Live mode:** set `paper_trading: false` in `config.yaml` *or* `ALPACA_PAPER_TRADING=false`, and use **live** API keys.
-
-## Architecture
-
-```mermaid
-flowchart LR
-  A[Alpaca market data] --> B[Indicators + signals]
-  B --> C[ATR sizing / stops]
-  C --> D[Alpaca orders]
-  D --> E[SQLite ledger]
-  E --> F[Metrics report]
-```
-
-Stack: Python 3.10+, `requests` (Alpaca REST, no official SDK), `pandas` / `numpy`, `PyYAML`, `python-dotenv`, SQLite, `pytest`.
-
-## Design decisions
-
-### Alpaca IEX bars instead of Yahoo (or SIP)
-**What I chose:** Live prices and bars come from Alpaca’s market-data REST endpoints with `feed=iex` for equities (`tradingbot/broker.py`). Crypto uses Alpaca’s crypto trade/bars APIs.
-**Why:** An earlier loop pulled history via Yahoo/`yfinance` every scan. That was slow, rate-limited, and lagged the same venue that fills orders. Alpaca data keeps signals and execution on one broker; IEX is the free/paper-friendly equity feed.
-**Trade-off:** IEX is not full SIP depth or NBBO completeness — some prints and names will look different than a paid consolidated feed.
-
-### In-process TTL cache + full watchlist scans
-**What I chose:** A small `_TTLCache` on bars/prices/account/positions (`broker.py`). Default universe is a curated priority watchlist (`stocks: watchlist`) scanned **every** loop when it fits under `scan_batch_size`. Multi-symbol bar requests use 50-symbol chunks.
-**Why:** A rotating `top_500` book sorted A→Z among equal scores spent loops on obscure tickers. Caching + a ≤100-name watchlist gets liquid names every cycle without hammering Alpaca; rotation only kicks in for huge `top_N` / `all` books.
-**Trade-off:** Cached closes can be up to ~`bars_ttl_seconds` stale. You only trade names on the watchlist unless you enlarge it or opt into `top_N`.
-
-### ATR stops and size-from-risk, not fixed %
-**What I chose:** Stops are `max(atr_stop_mult × ATR, min_stop_pct × price)` below longs / above shorts (`strategy._atr_stop`). Position size is `equity × risk_per_trade × conviction / |entry − stop|` with a per-trade max notional (`sizing.quantity_for_risk`). Conviction scales with score above `buy_score_min` (up to 1.3×). Trailing uses the same ATR once price has moved `trail_arm_atr_mult` in favor.
-**Why:** Fixed 2–3% stops treat quiet and volatile names the same. ATR ties stop distance (and therefore share count) to recent range so risk per trade is closer to a constant dollar/R target. A minimum stop width keeps 5-minute noise from producing 0.2% stops that slippage turns into multi-R losses.
-**Trade-off:** ATR is lagging and can widen in chaos, so size shrinks when you might most want conviction. There is no hard position-count cap by default (`max_positions: 0`); deployment is gated by per-trade max notional and available equity.
-
-### Score + “strong signal” gate instead of single-indicator or full AND
-**What I chose:** Entries accumulate weighted points (RSI / MACD / SMA / volume) and only fire when `buy_score_min` is met **and** at least one “strong” event fired (oversold/overbought, MACD cross, or SMA cross) — see `SignalStrategy.should_buy` / `should_short`. Soft confirmations alone never open a trade.
-**Why:** Pure single-indicator entries churned; requiring every indicator at once almost never fired. Scoring with a mandatory strong leg was the middle path (also: skip longs below SMA-20 unless RSI is actually oversold).
-**Trade-off:** Weights and thresholds are hand-tuned, not fit out-of-sample. Validate with paper trading and `backtest.py`, not a walk-forward optimizer (none ships in this repo).
-
-### Dual market rules: session-gated stocks vs 24/7 crypto fills
-**What I chose:** Equities only open/close when Alpaca’s clock says the session is open (`market_hours.py` / bot guards), with `time_in_force=day` and integer `qty`. Crypto is always “open,” uses `gtc` + **notional** market buys, then `wait_for_order_fill` to rewrite `order.quantity` from `filled_qty`. Crypto sells use exact qty so the bot never oversells.
-**Why:** US cash equities and Alpaca spot crypto are different products — hours, order semantics, and fractional sizing don’t share one path.
-**Trade-off:** Stock path does not wait on fills the same way (assumes day-market qty fills cleanly). Crypto shorts are disabled. Holiday fallback without Alpaca calendar is a short local holiday list.
-
-### SQLite ledger with Alpaca as position source of truth
-**What I chose:** Trades, bot counters, and trail events live in local SQLite (`tradingbot/memory.py`). On startup, `_restore_state` intersects open ledger rows with live Alpaca positions; missing broker positions are closed as ghosts at flat P&L.
-**Why:** SQLite keeps a queryable history for `scripts/report.py` without standing up Postgres. The broker still owns what you actually hold — the ledger must not invent positions after a crash or a paper-account reset.
-**Trade-off:** Single-writer, local-disk, not multi-instance safe. Ghost closes at `pnl=0` can hide real P&L if you flattened outside the bot. Metrics blend this ledger with Alpaca portfolio history when available.
-
-## Core concepts
-
-- **Session model:** Stocks trade only in the regular US equity session (Alpaca clock, local/holiday fallback). Crypto is treated as always open.
-- **Risk unit:** Size so that a full stop ≈ a fixed fraction of **equity** (`risk.*_per_trade`), not buying power. The ledger stores `initial_risk` / `r_multiple` for post-trade review.
-- **Universe:** Default is a curated priority watchlist (`stocks: watchlist` / `tradingbot/universe.py`), scanned every loop. `top_N` is priority-biased (not market cap); only rotates when larger than `scan_batch_size`.
-- **Metrics:** Risk-free rate `0%`; annualize equity √252, crypto √365, blended √365 (`metrics.py`). Sharpe/Sortino are marked unreliable until ≥30 calendar days and ≥21 daily return observations.
-
-## Project layout
-
-```text
-tradingbottest/
-├── main.py                 # paper/live loop
-├── backtest.py             # historical replay CLI
-├── config.yaml             # symbols + risk + strategy
-├── requirements.txt
-├── .env.example
-├── tradingbot/             # package
-│   ├── bot.py              # scan / size / execute / trail
-│   ├── broker.py           # Alpaca REST + cache
-│   ├── strategy.py         # signal scoring + ATR stops
-│   ├── sizing.py           # qty from equity risk × conviction
-│   ├── universe.py         # priority watchlist
-│   ├── indicators.py
-│   ├── market_hours.py
-│   ├── memory.py           # SQLite ledger
-│   ├── metrics.py
-│   ├── models.py
-│   ├── config.py
-│   ├── backtest.py
-│   └── env.py
-├── scripts/
-│   └── report.py
-└── tests/
-    └── test_metrics.py
-```
-
-`trading_data/` is created at runtime and gitignored.
-
-## Troubleshooting
-
-| Symptom | Fix |
-| --- | --- |
-| `Missing ALPACA_API_KEY` | Copy `.env.example` to `.env`, run from repo root |
-| `401 unauthorized` | New paper keys; keep values in double quotes |
-| Could not reach Alpaca | Wrong keys, or live keys with paper mode on |
-| Account status is not `ACTIVE` | Reset/create a paper account in the Alpaca dashboard, then update `.env` |
-| `ModuleNotFoundError` | Activate venv, then `pip install -r requirements.txt` |
-| YAML ticker becomes `True` | Quote booleans like `"ON"` in `config.yaml` |
-| Metrics all `n/a` | No closed trades yet — expected early on |
 
 ## Limitations
 
-- No published performance numbers until paper trades accumulate (`scripts/report.py`)
-- Equity long + short (easy-to-borrow); crypto long-only; no portfolio optimizer
-- Stock bars use Alpaca `feed=iex` (paper-friendly; SIP may need a paid data plan)
-- Experimental software — paper trade first; live trading is at your own risk
+- The year replay above is +13.3% at +0.10R per trade. In the Monte Carlo, 20.8% of reshuffles of those same trades finish below the starting $10,000.
+- Fees and slippage are not modeled in the backtest.
+- Equity bars use Alpaca's IEX feed, which covers only a slice of total market volume, so volume signals reflect IEX prints only.
+- The stock watchlist is the current 81 names, so a backtest never sees companies that left that list.
+- Crypto is long-only. Position sizing is per trade, with no portfolio-level optimizer.
+- Experimental software. Paper trade first; live trading is at your own risk.
+
+MIT license. The import package is `tradingbot/`.

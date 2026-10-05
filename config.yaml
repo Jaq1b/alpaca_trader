@@ -1,11 +1,18 @@
+# Paper trading. Set paper_trading to false only with live Alpaca keys.
 paper_trading: true
+
+# SQLite ledger and the metrics JSON live in this directory.
 data_dir: trading_data
-initial_capital: 1000.0
+
+# Fallback starting equity when Alpaca history has no base value.
+# Live order size uses the equity returned by the API, not this number.
+initial_capital: 100000.0
 
 symbols:
-  # watchlist = PRIORITY_SYMBOLS (full scan each loop). Also: ticker list, top_N, all.
+  # watchlist = tradingbot/universe.py
+  # Also: a ticker list, top_N (example top_50), or all.
   stocks: watchlist
-  # Keep >= watchlist length for full coverage. Bars are batched + TTL-cached.
+  # Stocks fetched per pass. Keep this >= the watchlist so every name is scanned.
   scan_batch_size: 100
   crypto:
     - BTC/USD
@@ -15,40 +22,55 @@ symbols:
     - DOGE/USD
 
 risk:
-  # Fraction of equity risked if the stop is hit (not buying power).
+  # Fraction of equity lost if the stop is hit. 0.008 = 0.8%.
   crypto_per_trade: 0.006
   stock_per_trade: 0.008
-  # 0 = no slot cap; per-trade max notional + equity gate deployment.
+  # 0 = no limit on how many names can be open.
   max_positions: 0
+  # Seconds a position must be held before a signal exit. Stops ignore this.
   min_hold_seconds: 300
+  # Seconds between scans.
   check_interval_seconds: 45
+  # Dollar cap on a single position.
   max_position_value_crypto: 2000.0
   max_position_value_stock: 4000.0
+  # Skip orders smaller than this.
   min_position_value: 250.0
-  allow_shorting: true  # stocks only; crypto stays long-only
+  # Stock shorts only, and only when Alpaca marks the name easy to borrow.
+  allow_shorting: true
 
 strategy:
+  # Seconds before the same symbol can signal again.
   signal_cooldown: 300
+  # Minimum score to open. A strong signal (RSI extreme, MACD cross, or SMA cross) is also required.
   buy_score_min: 5
   buy_score_min_crypto: 5
+  # Minimum score to exit on a signal.
   sell_score_min: 4
+  # Stop new entries in a name after this many losing closes in the past day.
   max_recent_losses: 2
   rsi_period: 14
   rsi_oversold: 30
   rsi_overbought: 70
   atr_period: 14
+  # Stop distance in ATRs. Also kept at least min_stop_pct_* away from the entry.
   atr_stop_mult: 2.5
-  # Floor so 5Min ATR cannot place sub-1% stops that slippage blows through.
   min_stop_pct_stock: 0.008
   min_stop_pct_crypto: 0.015
-  atr_trail_mult: 2.0
-  trail_arm_atr_mult: 1.5
+  # After this many R of open profit, move the stop to the entry.
+  breakeven_r: 1.0
+  # After this many R, trail the stop by trail_distance_r behind price.
+  trail_arm_r: 1.5
+  trail_distance_r: 1.0
+  # Volume must exceed this multiple of its recent average to score.
   volume_mult_stock: 1.4
   volume_mult_crypto: 1.25
+  # Unrealized gain, in percent, that adds exit points.
   take_profit_pct_stock: 4.0
   take_profit_pct_crypto: 6.0
   solid_profit_pct_stock: 2.5
   solid_profit_pct_crypto: 4.0
+  # Bars required before a new entry.
   min_bars: 40
 
 cache:
@@ -60,7 +82,11 @@ cache:
   calendar_ttl_seconds: 3600
 
 backtest:
+  # Used when start and end are omitted: replay the last N days ending today.
   lookback_days: 30
+  # Optional trade window, YYYY-MM-DD. Command flags override these.
+  # start: "2026-01-02"
+  # end: "2026-03-31"
+  # Starting cash for the replay. Separate from initial_capital above.
   initial_capital: 10000.0
   timeframe: 5Min
-  bar_limit: 5000

@@ -390,7 +390,7 @@ class PerformanceAnalyzer:
         self.initial_capital = float(
             initial_capital
             if initial_capital is not None
-            else state.get("initial_capital") or 1000.0
+            else state.get("initial_capital") or 100000.0
         )
 
     def build_report(self) -> dict[str, Any]:
@@ -584,8 +584,60 @@ class PerformanceAnalyzer:
         return report
 
 
+def format_summary(report: dict[str, Any]) -> str:
+    """Short performance block for a live demo. Detail lives in format_report."""
+    ret = report.get("returns", {})
+    ts = report.get("trade_stats", {})
+    ev = report.get("evaluation", {})
+    rec = report.get("alpaca_reconciliation", {})
+    by_class = ts.get("by_asset_class") or {}
+
+    def money_or_na(value) -> str:
+        if not isinstance(value, (int, float)):
+            return "n/a"
+        return f"${value:,.2f}"
+
+    avg_loss = ts.get("average_loss")
+    if isinstance(avg_loss, (int, float)):
+        loss_txt = f"-${abs(avg_loss):,.2f}"
+    else:
+        loss_txt = "n/a"
+    win_rate = ts.get("win_rate")
+    win_txt = f"{win_rate:.1%}" if isinstance(win_rate, (int, float)) else "n/a"
+    pf = ts.get("profit_factor")
+    if pf == float("inf"):
+        pf_txt = "inf"
+    elif isinstance(pf, (int, float)):
+        pf_txt = f"{pf:.2f}"
+    else:
+        pf_txt = "n/a"
+
+    lines = [
+        "Performance",
+        f"  Window          {ev.get('start') or '—'} to {ev.get('end') or '—'}",
+        f"  Closed P&L      {money_or_na(ret.get('absolute_pnl_closed_trades'))}",
+        f"  Stocks          {money_or_na(ret.get('absolute_pnl_equity'))}  "
+        f"({by_class.get('equity', 0)} trades)",
+        f"  Crypto          {money_or_na(ret.get('absolute_pnl_crypto'))}  "
+        f"({by_class.get('crypto', 0)} trades)",
+        f"  Trades          {ts.get('total_trades', 0)}   win rate {win_txt}",
+        f"  Avg win / loss  {money_or_na(ts.get('average_win'))} / {loss_txt}",
+        f"  Profit factor   {pf_txt}",
+    ]
+    portfolio = rec.get("alpaca_portfolio_value")
+    if isinstance(portfolio, (int, float)):
+        unreal = rec.get("alpaca_open_unrealized_pl")
+        if isinstance(unreal, (int, float)) and unreal < 0:
+            unreal_txt = f"-${abs(unreal):,.2f}"
+        else:
+            unreal_txt = money_or_na(unreal)
+        lines.append(f"  Account value   {money_or_na(portfolio)}")
+        lines.append(f"  Open P&L        {unreal_txt}")
+    return "\n".join(lines)
+
+
 def format_report(report: dict[str, Any]) -> str:
-    """Human-readable terminal summary."""
+    """Full metrics dump, including ratio reliability notes."""
     lines = []
     lines.append("=" * 64)
     lines.append("PERFORMANCE REPORT")

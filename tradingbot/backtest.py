@@ -3,17 +3,139 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import pandas as pd
 
-from tradingbot.sizing import quantity_for_risk, unrealized_pnl
+from tradingbot.sizing import (
+    favorable_r,
+    quantity_for_risk,
+    tighten_stop,
+    unrealized_pnl,
+)
+from tradingbot.snapshots import BarTable
 from tradingbot.strategy import SignalStrategy
 from tradingbot.universe import PRIORITY_SYMBOLS
 
 logger = logging.getLogger(__name__)
+
+_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}$")
+
+
+def warmup_calendar_days(timeframe: str, min_bars: int) -> int:
+    """Calendar days of bars to load before the first trade day."""
+    tf = (timeframe or "5Min").strip().lower()
+    if tf in {"1day", "1d"}:
+        return int(min_bars) + 10
+    if tf in {"1hour", "4hour"}:
+        return max(14, (int(min_bars) // 6) + 7)
+    return 7
+
+
+def parse_bound(value: Any, *, is_end: bool) -> datetime | None:
+    """Parse a backtest bound. A date-only end includes that whole UTC day."""
+    if value is None:
+        return None
+    date_only = False
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, date):
+        date_only = True
+        dt = datetime(value.year, value.month, value.day)
+    else:
+        text = str(value).strip()
+        if not text or text.lower() in {"none", "null", "~"}:
+            return None
+        if _DATE_ONLY.fullmatch(text):
+            date_only = True
+            dt = datetime.strptime(text, "%Y-%m-%d")
+        else:
+            raw = text[:-1] if text.endswith("Z") else text
+            parsed = None
+            for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    parsed = datetime.strptime(raw, fmt)
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                raise ValueError(f"Backtest date must be YYYY-MM-DD (got {value!r})")
+            dt = parsed
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    if date_only and is_end:
+        dt = dt.replace(hour=23, minute=59, second=59)
+    return dt
+
+
+def resolve_window(
+    *,
+    lookback_days: int,
+    start: Any = None,
+    end: Any = None,
+    now: datetime | None = None,
+    warmup_days: int = 7,
+) -> tuple[datetime, datetime, datetime, datetime]:
+    """Return fetch_start, fetch_end, trade_start, trade_end in UTC.
+
+    With no dates, the trade window is the last `lookback_days` ending now.
+    Bars before trade_start are loaded so indicators are warm on day one.
+    """
+    clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
+    else:
+        clock = clock.astimezone(timezone.utc)
+
+    trade_start = parse_bound(start, is_end=False)
+    trade_end = parse_bound(end, is_end=True)
+    if trade_start is None and trade_end is None:
+        trade_end = clock
+        trade_start = clock - timedelta(days=max(int(lookback_days), 1))
+    elif trade_start is None:
+        trade_start = trade_end - timedelta(days=max(int(lookback_days), 1))
+    elif trade_end is None:
+        trade_end = clock
+    if trade_start > trade_end:
+        raise ValueError(
+            "Backtest start "
+            f"{trade_start.strftime('%Y-%m-%d')} is after end "
+            f"{trade_end.strftime('%Y-%m-%d')}"
+        )
+    fetch_start = trade_start - timedelta(days=max(int(warmup_days), 0))
+    return fetch_start, trade_end, trade_start, trade_end
+
+
+def bar_epoch(ts) -> float:
+    """UTC epoch seconds for a bar timestamp. Naive stamps are treated as UTC."""
+    stamp = pd.Timestamp(ts)
+    if stamp.tzinfo is None:
+        stamp = stamp.tz_localize("UTC")
+    return float(stamp.timestamp())
+
+
+def in_window(ts, trade_start: datetime, trade_end: datetime) -> bool:
+    stamp = pd.Timestamp(ts)
+    start = pd.Timestamp(trade_start)
+    end = pd.Timestamp(trade_end)
+    if stamp.tzinfo is None:
+        if start.tzinfo is not None:
+            start = start.tz_convert("UTC").tz_localize(None)
+        if end.tzinfo is not None:
+            end = end.tz_convert("UTC").tz_localize(None)
+    else:
+        if start.tzinfo is None:
+            start = start.tz_localize("UTC")
+        if end.tzinfo is None:
+            end = end.tz_localize("UTC")
+        start = start.tz_convert(stamp.tz)
+        end = end.tz_convert(stamp.tz)
+    return bool(start <= stamp <= end)
 
 
 class InMemoryTradeStore:
@@ -48,6 +170,18 @@ class _TradeView:
         return self._data.get("timestamp", "")
 
 
+def format_elapsed(seconds: float) -> str:
+    """Clock time for a run: 12.4s, 4m 14s, or 1h 2m 3s."""
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    whole = int(seconds)
+    minutes, secs = divmod(whole, 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {minutes}m {secs}s"
+    return f"{minutes}m {secs}s"
+
+
 @dataclass
 class BacktestResult:
     initial_capital: float
@@ -62,11 +196,15 @@ class BacktestResult:
     max_drawdown: float
     trades_per_day: float
     trades: list[dict[str, Any]] = field(default_factory=list)
+    window_label: str = ""
+    elapsed_seconds: float = 0.0
 
     def summary(self) -> str:
-        return "\n".join(
+        lines = ["Backtest"]
+        if self.window_label:
+            lines.append(f"  window      {self.window_label}")
+        lines.extend(
             [
-                "Backtest",
                 f"  capital     ${self.initial_capital:,.2f} → ${self.ending_capital:,.2f}",
                 f"  P&L         ${self.total_pnl:,.2f}",
                 f"  trades      {self.total_trades}  "
@@ -76,6 +214,9 @@ class BacktestResult:
                 f"  max DD      {self.max_drawdown:.1%}  trades/day {self.trades_per_day:.2f}",
             ]
         )
+        if self.elapsed_seconds > 0:
+            lines.append(f"  elapsed     {format_elapsed(self.elapsed_seconds)}")
+        return "\n".join(lines)
 
 
 class Backtester:
@@ -84,6 +225,8 @@ class Backtester:
         broker,
         config: dict[str, Any],
         initial_capital: float | None = None,
+        start: Any = None,
+        end: Any = None,
     ):
         self.broker = broker
         self.config = config
@@ -95,7 +238,24 @@ class Backtester:
         )
         self.lookback_days = int(bt.get("lookback_days", 30))
         self.timeframe = bt.get("timeframe", "5Min")
-        self.bar_limit = int(bt.get("bar_limit", 5000))
+        min_bars = int(config.get("strategy", {}).get("min_bars", 40))
+        chosen_start = start if start not in (None, "") else bt.get("start")
+        chosen_end = end if end not in (None, "") else bt.get("end")
+        (
+            self.fetch_start,
+            self.fetch_end,
+            self.trade_start,
+            self.trade_end,
+        ) = resolve_window(
+            lookback_days=self.lookback_days,
+            start=chosen_start,
+            end=chosen_end,
+            warmup_days=warmup_calendar_days(self.timeframe, min_bars),
+        )
+        self.window_label = (
+            f"{self.trade_start.strftime('%Y-%m-%d')} to "
+            f"{self.trade_end.strftime('%Y-%m-%d')}"
+        )
         self.risk_cfg = config.get("risk", {})
         self.strategy_cfg = config.get("strategy", {})
         stocks_cfg = config.get("symbols", {}).get("stocks", "watchlist")
@@ -114,30 +274,38 @@ class Backtester:
             1, int(self.risk_cfg.get("min_hold_seconds", 300) / 300)
         )
         self.min_position_value = float(self.risk_cfg.get("min_position_value", 250.0))
-        self.atr_trail_mult = float(self.strategy_cfg.get("atr_trail_mult", 2.0))
-        self.trail_arm_atr_mult = float(
-            self.strategy_cfg.get("trail_arm_atr_mult", 1.5)
-        )
+        self.breakeven_r = float(self.strategy_cfg.get("breakeven_r", 1.0))
+        self.trail_arm_r = float(self.strategy_cfg.get("trail_arm_r", 1.5))
+        self.trail_distance_r = float(self.strategy_cfg.get("trail_distance_r", 1.0))
         self.allow_shorting = bool(self.risk_cfg.get("allow_shorting", True))
 
     def _asset_class(self, symbol: str) -> str:
         return "crypto" if symbol in self.crypto_symbols else "stock"
 
     def _load_history(self) -> dict[str, pd.DataFrame]:
-        end = datetime.now(timezone.utc)
-        start = end - timedelta(days=self.lookback_days)
-        start_str = start.strftime("%Y-%m-%dT%H:%M:%SZ")
-        end_str = end.strftime("%Y-%m-%dT%H:%M:%SZ")
+        logger.info(
+            f"Backtest window  {self.window_label}  "
+            f"bars from {self.fetch_start.strftime('%Y-%m-%d')}"
+        )
         history = {}
         for symbol in self.symbols:
-            df = self.broker.get_bars(
-                symbol,
-                timeframe=self.timeframe,
-                limit=self.bar_limit,
-                start=start_str,
-                end=end_str,
-                force=True,
-            )
+            df = None
+            for attempt in (1, 2):
+                try:
+                    df = self.broker.get_bars_range(
+                        symbol,
+                        timeframe=self.timeframe,
+                        start=self.fetch_start,
+                        end=self.fetch_end,
+                    )
+                    break
+                except Exception as exc:
+                    if attempt == 1:
+                        logger.warning(f"{symbol} download failed, retrying: {exc}")
+                        continue
+                    logger.warning(f"No history for {symbol}: {exc}")
+            if df is None:
+                continue
             if df is not None and not df.empty:
                 history[symbol] = df.sort_index()
             else:
@@ -165,10 +333,15 @@ class Backtester:
                 0,
                 0,
                 0,
+                window_label=self.window_label,
             )
 
         memory = InMemoryTradeStore()
         strategy = SignalStrategy(memory, self.strategy_cfg)
+        books = {
+            symbol: BarTable(frame, self.strategy_cfg, self._asset_class(symbol))
+            for symbol, frame in history.items()
+        }
 
         cash = self.initial_capital
         equity_peak = self.initial_capital
@@ -179,39 +352,42 @@ class Backtester:
         all_ts = sorted({ts for df in history.values() for ts in df.index})
         window = max(self.strategy_cfg.get("min_bars", 40), 40)
 
-        for i, ts in enumerate(all_ts):
+        for ts in all_ts:
+            if not in_window(ts, self.trade_start, self.trade_end):
+                continue
+            epoch = bar_epoch(ts)
+            strategy.now = lambda epoch=epoch: epoch
             equity = cash
             for pos in open_positions.values():
-                df = history[pos["symbol"]]
-                if ts in df.index:
-                    equity += float(df.loc[ts]["Close"]) * pos["quantity"]
+                book = books[pos["symbol"]]
+                loc = book.loc_of.get(ts)
+                mark = float(book.close[loc]) if loc is not None else pos["entry_price"]
+                qty = pos["quantity"]
+                if pos.get("side") == "short":
+                    # Cash already holds the reserved entry notional.
+                    equity += (2 * pos["entry_price"] - mark) * qty
                 else:
-                    equity += pos["entry_price"] * pos["quantity"]
+                    equity += mark * qty
             equity_peak = max(equity_peak, equity)
             if equity_peak > 0:
                 max_drawdown = max(max_drawdown, (equity_peak - equity) / equity_peak)
 
-            for symbol, df in history.items():
-                if ts not in df.index:
-                    continue
-                loc = df.index.get_loc(ts)
-                if isinstance(loc, slice):
-                    continue
-                if loc < window:
+            for symbol, book in books.items():
+                loc = book.loc_of.get(ts)
+                if loc is None or loc < window:
                     continue
 
-                window_df = df.iloc[: loc + 1].tail(120)
-                bar = df.iloc[loc]
-                price = float(bar["Close"])
-                low = float(bar["Low"])
-                asset_class = self._asset_class(symbol)
+                price = float(book.close[loc])
+                low = float(book.low[loc])
+                high = float(book.high[loc])
+                asset_class = book.asset_class
+                snap = book.snapshot(loc, symbol)
 
                 # Manage open position
                 if symbol in open_positions:
                     pos = open_positions[symbol]
                     pos["bars_held"] += 1
                     side = pos.get("side", "long")
-                    high = float(bar["High"])
 
                     # Stop hit intrabar
                     stopped = (
@@ -238,27 +414,54 @@ class Backtester:
                             cash += pos["entry_price"] * pos["quantity"]
                         continue
 
-                    # ATR trail
-                    atr = pos.get("atr") or 0.0
-                    if side == "long":
-                        profit = price - pos["entry_price"]
-                        if atr > 0 and profit >= self.trail_arm_atr_mult * atr:
-                            new_stop = price - self.atr_trail_mult * atr
-                            pos["stop_loss"] = max(pos["stop_loss"], new_stop)
-                    else:
-                        profit = pos["entry_price"] - price
-                        if atr > 0 and profit >= self.trail_arm_atr_mult * atr:
-                            new_stop = price + self.atr_trail_mult * atr
-                            pos["stop_loss"] = min(pos["stop_loss"], new_stop)
+                    risk_unit = pos.get("risk_per_unit") or 0.0
+                    pos["stop_loss"] = tighten_stop(
+                        side=side,
+                        entry_price=pos["entry_price"],
+                        stop_loss=pos["stop_loss"],
+                        price=price,
+                        risk_per_unit=risk_unit,
+                        breakeven_r=self.breakeven_r,
+                        trail_arm_r=self.trail_arm_r,
+                        trail_distance_r=self.trail_distance_r,
+                    )
 
                     if pos["bars_held"] >= self.min_hold_bars:
+                        r_now = favorable_r(pos["entry_price"], price, risk_unit, side)
+                        abandon, abandon_reason = strategy.should_abandon(
+                            None, symbol, asset_class, side, r_now, snapshot=snap
+                        )
+                        if abandon:
+                            self._close(
+                                pos,
+                                price,
+                                ts,
+                                abandon_reason,
+                                open_positions,
+                                closed_trades,
+                                memory,
+                            )
+                            if side == "long":
+                                cash += price * pos["quantity"]
+                            else:
+                                cash += (pos["entry_price"] - price) * pos["quantity"]
+                                cash += pos["entry_price"] * pos["quantity"]
+                            continue
                         if side == "short":
                             should_exit, reason = strategy.should_cover(
-                                window_df, symbol, pos["entry_price"], asset_class
+                                None,
+                                symbol,
+                                pos["entry_price"],
+                                asset_class,
+                                snapshot=snap,
                             )
                         else:
                             should_exit, reason = strategy.should_sell(
-                                window_df, symbol, pos["entry_price"], asset_class
+                                None,
+                                symbol,
+                                pos["entry_price"],
+                                asset_class,
+                                snapshot=snap,
                             )
                         if should_exit:
                             self._close(
@@ -282,14 +485,14 @@ class Backtester:
                     continue
 
                 should_buy, reason, stop_loss, atr, score = strategy.should_buy(
-                    window_df, symbol, asset_class
+                    None, symbol, asset_class, snapshot=snap
                 )
                 side = "long"
                 if not should_buy or stop_loss <= 0:
                     if not (self.allow_shorting and asset_class == "stock"):
                         continue
                     should_short, reason, stop_loss, atr, score = strategy.should_short(
-                        window_df, symbol, asset_class
+                        None, symbol, asset_class, snapshot=snap
                     )
                     if not should_short or stop_loss <= 0:
                         continue
@@ -331,6 +534,7 @@ class Backtester:
                     "stop_loss": stop_loss,
                     "atr": atr,
                     "initial_risk": stop_distance * qty,
+                    "risk_per_unit": stop_distance,
                     "timestamp": ts.isoformat(),
                     "asset_class": asset_class,
                     "reason": reason,
@@ -363,7 +567,7 @@ class Backtester:
         r_vals = [
             t["r_multiple"] for t in closed_trades if t.get("r_multiple") is not None
         ]
-        days = max(self.lookback_days, 1)
+        days = max((self.trade_end - self.trade_start).total_seconds() / 86400, 1)
         total_pnl = sum(t["pnl"] for t in closed_trades)
 
         return BacktestResult(
@@ -379,6 +583,7 @@ class Backtester:
             max_drawdown=max_drawdown,
             trades_per_day=len(closed_trades) / days,
             trades=closed_trades,
+            window_label=self.window_label,
         )
 
     def _close(

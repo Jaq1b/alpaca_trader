@@ -7,3 +7,5 @@ __pycache__/
 trading_data/
 .env
 .DS_Store
+before.txt
+after.txt

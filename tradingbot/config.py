@@ -51,7 +51,7 @@ def _defaults() -> dict[str, Any]:
     return {
         "paper_trading": True,
         "data_dir": "trading_data",
-        "initial_capital": 1000.0,
+        "initial_capital": 100000.0,
         "symbols": {
             "stocks": "watchlist",
             "scan_batch_size": 100,
@@ -81,8 +81,9 @@ def _defaults() -> dict[str, Any]:
             "atr_stop_mult": 2.5,
             "min_stop_pct_stock": 0.008,
             "min_stop_pct_crypto": 0.015,
-            "atr_trail_mult": 2.0,
-            "trail_arm_atr_mult": 1.5,
+            "breakeven_r": 1.0,
+            "trail_arm_r": 1.5,
+            "trail_distance_r": 1.0,
             "volume_mult_stock": 1.4,
             "volume_mult_crypto": 1.25,
             "take_profit_pct_stock": 4.0,
@@ -101,8 +102,9 @@ def _defaults() -> dict[str, Any]:
         },
         "backtest": {
             "lookback_days": 30,
+            "start": None,
+            "end": None,
             "initial_capital": 10000.0,
             "timeframe": "5Min",
-            "bar_limit": 5000,
         },
     }

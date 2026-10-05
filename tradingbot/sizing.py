@@ -1,4 +1,4 @@
-"""Shared position sizing: equity risk × conviction, capped by max notional."""
+"""Shared position sizing and stop updates: equity risk × conviction, then R."""
 
 
 def conviction_mult(score: int, score_min: int) -> float:
@@ -62,3 +62,47 @@ def unrealized_pnl(
         pnl = (current_price - entry_price) * qty
         pct = (current_price - entry_price) / entry_price * 100
     return pnl, pct
+
+
+def favorable_r(
+    entry_price: float, price: float, risk_per_unit: float, side: str = "long"
+) -> float:
+    """Open profit in units of the initial stop distance."""
+    if risk_per_unit <= 0:
+        return 0.0
+    move = (price - entry_price) if side == "long" else (entry_price - price)
+    return move / risk_per_unit
+
+
+def tighten_stop(
+    *,
+    side: str,
+    entry_price: float,
+    stop_loss: float,
+    price: float,
+    risk_per_unit: float,
+    breakeven_r: float = 1.0,
+    trail_arm_r: float = 1.5,
+    trail_distance_r: float = 1.0,
+) -> float:
+    """Move the stop toward price. Never loosens it.
+
+    At +breakeven_r the stop goes to entry. At +trail_arm_r it trails
+    trail_distance_r behind price, so a 1.5R run locks about 0.5R.
+    """
+    if risk_per_unit <= 0 or price <= 0:
+        return stop_loss
+    r_now = favorable_r(entry_price, price, risk_per_unit, side)
+    if side == "long":
+        new_stop = stop_loss
+        if r_now >= breakeven_r:
+            new_stop = max(new_stop, entry_price)
+        if r_now >= trail_arm_r:
+            new_stop = max(new_stop, price - trail_distance_r * risk_per_unit)
+        return new_stop
+    new_stop = stop_loss
+    if r_now >= breakeven_r:
+        new_stop = min(new_stop, entry_price)
+    if r_now >= trail_arm_r:
+        new_stop = min(new_stop, price + trail_distance_r * risk_per_unit)
+    return new_stop

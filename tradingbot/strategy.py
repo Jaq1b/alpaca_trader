@@ -15,6 +15,9 @@ class SignalStrategy:
         self.cfg = config or {}
         self.last_signal_time: dict[str, float] = {}
         self.signal_cooldown = self.cfg.get("signal_cooldown", 300)
+        # Live trading uses wall time. The backtest replaces this with bar time
+        # so a fast replay does not freeze entries for months of history.
+        self.now = time.time
 
     def entry_score_min(self, asset_class: str = "stock") -> int:
         if asset_class == "crypto":
@@ -154,9 +157,18 @@ class SignalStrategy:
             return f"Too many recent losses ({losses})"
 
         last = self.last_signal_time.get(symbol)
-        if last is not None and time.time() - last < self.signal_cooldown:
+        if last is not None and self.now() - last < self.signal_cooldown:
             return "Signal cooldown active"
         return None
+
+    def _range_wide_enough(
+        self, price: float, atr_value: float, asset_class: str
+    ) -> bool:
+        """False when the stop would be the percent floor, not the ATR."""
+        if price <= 0 or atr_value <= 0:
+            return False
+        mult = float(self.cfg.get("atr_stop_mult", 2.5))
+        return atr_value * mult >= price * self._min_stop_pct(asset_class)
 
     def _score_entry(self, snapshot: dict, side: str) -> tuple[list[str], int, bool]:
         """Shared long/short signal scoring. Returns (signals, score, has_strong)."""
@@ -215,21 +227,26 @@ class SignalStrategy:
 
     def _try_entry(
         self,
-        bars: pd.DataFrame,
+        bars: pd.DataFrame | None,
         symbol: str,
         asset_class: str,
         side: str,
+        snapshot: dict | None = None,
     ) -> tuple[bool, str, float, float, int]:
         label = "BUY" if side == "long" else "SHORT"
         weak = "buy" if side == "long" else "short"
 
-        snapshot = self.analyze_market(bars, symbol, asset_class)
+        if snapshot is None:
+            snapshot = self.analyze_market(bars, symbol, asset_class)
         if snapshot.get("insufficient_data"):
             return False, "Insufficient data", 0.0, 0.0, 0
 
         blocked = self._entry_blocked(symbol)
         if blocked:
             return False, blocked, 0.0, 0.0, 0
+
+        if not self._range_wide_enough(snapshot["price"], snapshot["atr"], asset_class):
+            return False, "Range tighter than minimum stop", 0.0, 0.0, 0
 
         if side == "long":
             if not snapshot["sma"]["above_sma_20"] and not snapshot["rsi"]["oversold"]:
@@ -243,7 +260,7 @@ class SignalStrategy:
         required = self.entry_score_min(asset_class)
 
         if score >= required and strong:
-            self.last_signal_time[symbol] = time.time()
+            self.last_signal_time[symbol] = self.now()
             return (
                 True,
                 f"{label}: {', '.join(signals)} (Score: {score})",
@@ -261,60 +278,105 @@ class SignalStrategy:
         )
 
     def should_buy(
-        self, bars: pd.DataFrame, symbol: str, asset_class: str = "stock"
+        self,
+        bars: pd.DataFrame | None,
+        symbol: str,
+        asset_class: str = "stock",
+        snapshot: dict | None = None,
     ) -> tuple[bool, str, float, float, int]:
-        return self._try_entry(bars, symbol, asset_class, "long")
+        return self._try_entry(bars, symbol, asset_class, "long", snapshot)
 
     def should_short(
-        self, bars: pd.DataFrame, symbol: str, asset_class: str = "stock"
+        self,
+        bars: pd.DataFrame | None,
+        symbol: str,
+        asset_class: str = "stock",
+        snapshot: dict | None = None,
     ) -> tuple[bool, str, float, float, int]:
         if asset_class == "crypto":
             return False, "Crypto shorts disabled", 0.0, 0.0, 0
-        return self._try_entry(bars, symbol, asset_class, "short")
+        return self._try_entry(bars, symbol, asset_class, "short", snapshot)
 
     def should_sell(
         self,
-        bars: pd.DataFrame,
+        bars: pd.DataFrame | None,
         symbol: str,
         entry_price: float | None = None,
         asset_class: str = "stock",
+        snapshot: dict | None = None,
     ) -> tuple[bool, str]:
-        return self._should_exit(bars, symbol, entry_price, asset_class, side="long")
+        return self._should_exit(
+            bars, symbol, entry_price, asset_class, side="long", snapshot=snapshot
+        )
 
     def should_cover(
         self,
-        bars: pd.DataFrame,
+        bars: pd.DataFrame | None,
         symbol: str,
         entry_price: float | None = None,
         asset_class: str = "stock",
+        snapshot: dict | None = None,
     ) -> tuple[bool, str]:
-        return self._should_exit(bars, symbol, entry_price, asset_class, side="short")
+        return self._should_exit(
+            bars, symbol, entry_price, asset_class, side="short", snapshot=snapshot
+        )
 
     def _should_exit(
         self,
-        bars: pd.DataFrame,
+        bars: pd.DataFrame | None,
         symbol: str,
         entry_price: float,
         asset_class: str,
         side: str,
+        snapshot: dict | None = None,
     ) -> tuple[bool, str]:
-        snapshot = self.analyze_market(bars, symbol, asset_class)
+        if snapshot is None:
+            snapshot = self.analyze_market(bars, symbol, asset_class)
         if snapshot.get("insufficient_data"):
             return False, "Insufficient data"
-
-        last = self.last_signal_time.get(symbol)
-        if last is not None and time.time() - last < self.signal_cooldown:
-            return False, "Signal cooldown active"
 
         label = "SELL" if side == "long" else "COVER"
         signals, score = self._exit_signals(snapshot, side, entry_price, asset_class)
 
         required = self.cfg.get("sell_score_min", 3)
         if score >= required:
-            self.last_signal_time[symbol] = time.time()
+            self.last_signal_time[symbol] = self.now()
             return True, f"{label}: {', '.join(signals)} (Score: {score})"
-
         return False, f"Weak {label.lower()}: {', '.join(signals)} (Score: {score})"
+
+    def should_abandon(
+        self,
+        bars: pd.DataFrame | None,
+        symbol: str,
+        asset_class: str,
+        side: str,
+        unrealized_r: float,
+        snapshot: dict | None = None,
+    ) -> tuple[bool, str]:
+        """Exit a loser when the entry cross has flipped. Winners are left alone."""
+        if unrealized_r >= 0:
+            return False, ""
+        if snapshot is None:
+            snapshot = self.analyze_market(bars, symbol, asset_class)
+        if snapshot.get("insufficient_data"):
+            return False, ""
+        macd_s = snapshot["macd"]
+        sma_s = snapshot["sma"]
+        if side == "long":
+            if macd_s["bearish_cross"]:
+                reason = "MACD bearish cross"
+            elif sma_s["sma_cross_down"]:
+                reason = "SMA cross down"
+            else:
+                return False, ""
+        elif macd_s["bullish_cross"]:
+            reason = "MACD bullish cross"
+        elif sma_s["sma_cross_up"]:
+            reason = "SMA cross up"
+        else:
+            return False, ""
+        self.last_signal_time[symbol] = self.now()
+        return True, f"Thesis broken: {reason}"
 
     def _exit_signals(
         self,
