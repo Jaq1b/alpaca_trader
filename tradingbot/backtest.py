@@ -198,6 +198,7 @@ class BacktestResult:
     trades: list[dict[str, Any]] = field(default_factory=list)
     window_label: str = ""
     elapsed_seconds: float = 0.0
+    equity_curve: list[tuple[str, float]] = field(default_factory=list)
 
     def summary(self) -> str:
         lines = ["Backtest"]
@@ -348,6 +349,7 @@ class Backtester:
         max_drawdown = 0.0
         open_positions: dict[str, dict[str, Any]] = {}
         closed_trades: list[dict[str, Any]] = []
+        daily_equity: dict[str, float] = {}
 
         all_ts = sorted({ts for df in history.values() for ts in df.index})
         window = max(self.strategy_cfg.get("min_bars", 40), 40)
@@ -371,6 +373,10 @@ class Backtester:
             equity_peak = max(equity_peak, equity)
             if equity_peak > 0:
                 max_drawdown = max(max_drawdown, (equity_peak - equity) / equity_peak)
+            stamp = pd.Timestamp(ts)
+            if stamp.tzinfo is not None:
+                stamp = stamp.tz_convert("UTC")
+            daily_equity[stamp.date().isoformat()] = float(equity)
 
             for symbol, book in books.items():
                 loc = book.loc_of.get(ts)
@@ -569,6 +575,8 @@ class Backtester:
         ]
         days = max((self.trade_end - self.trade_start).total_seconds() / 86400, 1)
         total_pnl = sum(t["pnl"] for t in closed_trades)
+        daily_equity[self.trade_end.date().isoformat()] = float(cash)
+        equity_curve = [(day, daily_equity[day]) for day in sorted(daily_equity)]
 
         return BacktestResult(
             initial_capital=self.initial_capital,
@@ -584,6 +592,7 @@ class Backtester:
             trades_per_day=len(closed_trades) / days,
             trades=closed_trades,
             window_label=self.window_label,
+            equity_curve=equity_curve,
         )
 
     def _close(

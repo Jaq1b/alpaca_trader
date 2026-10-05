@@ -22,6 +22,7 @@ class MonteCarloResult:
     ending_p5: float
     ending_p50: float
     ending_p95: float
+    max_drawdown_p5: float
     max_drawdown_p50: float
     max_drawdown_p95: float
     probability_loss: float
@@ -35,10 +36,11 @@ class MonteCarloResult:
                 f"  observed    ${self.observed_ending:,.2f}",
                 f"  ending      p5 ${self.ending_p5:,.2f}  "
                 f"p50 ${self.ending_p50:,.2f}  p95 ${self.ending_p95:,.2f}",
-                f"  max DD      p50 {self.max_drawdown_p50:.1%}  "
+                f"  max DD      p5 {self.max_drawdown_p5:.1%}  "
+                f"p50 {self.max_drawdown_p50:.1%}  "
                 f"p95 {self.max_drawdown_p95:.1%}",
                 f"  P(loss)     {self.probability_loss:.1%}",
-                "  note        Paths reuse these trades. They do not create new prices.",
+                "  note        Draws with replacement treat these trades as independent.",
             ]
         )
 
@@ -90,6 +92,7 @@ def simulate(
         ending_p5=float(np.percentile(ending, 5)),
         ending_p50=float(np.percentile(ending, 50)),
         ending_p95=float(np.percentile(ending, 95)),
+        max_drawdown_p5=float(np.percentile(max_dd, 5)),
         max_drawdown_p50=float(np.percentile(max_dd, 50)),
         max_drawdown_p95=float(np.percentile(max_dd, 95)),
         probability_loss=float(np.mean(ending < initial_capital)),

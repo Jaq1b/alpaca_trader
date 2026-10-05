@@ -23,11 +23,11 @@ Paper trading is the default. Live mode uses real money.
 | | p5 | p50 | p95 |
 | --- | --- | --- | --- |
 | Ending capital | $9,240.32 | $11,106.67 | $14,086.27 |
-| Max drawdown | | 5.3% | 11.2% |
+| Max drawdown (median / p95) | n/a | 5.3% | 11.2% |
 
-About one path in five finishes below $10,000 (20.8%). The historical path ended at $11,333.06, near the median. Fees and slippage are not modeled. A 36% win rate at +0.10R per trade is a thin result.
+About one path in five finishes below $10,000 (20.8%). Resampling treats trades as independent, which understates risk if losses cluster. The historical path ended at $11,333.06, near the median. Fees and slippage are not modeled. A 36% win rate at +0.10R per trade is a thin result.
 
-The live paper account is not listed here. `python main.py report` prints closed P&L and open P&L from your own ledger. `--verbose` adds Sharpe, Sortino, and drawdown, and those ratios stay labeled unreliable until the window is long enough.
+The live paper account is not listed here: it ran earlier versions of the strategy, so its P&L is not comparable to this replay. `python main.py report` prints closed P&L and open P&L from your own ledger. `--verbose` adds Sharpe, Sortino, and drawdown, and those ratios stay labeled unreliable until the window is long enough.
 
 ## Demo
 
@@ -45,7 +45,7 @@ python main.py run          # scan and send paper orders until Ctrl+C
 
 `status` during the US session prints `regular hours`. Outside that window it prints `equities closed, crypto open`. Stocks are scanned only while the equity session is open. Crypto (BTC, ETH, SOL, XRP, DOGE) still is.
 
-A fill is one line. This is the shape of the log, not a recorded trade:
+An order attempt is one line, written before Alpaca confirms the fill. This is the shape of the log, not a recorded trade:
 
 ```text
 10:50:57  BUY  IBM  17 @ $229.68  stop $227.84  risk $31  RSI oversold, MACD bullish cross (Score: 6)
@@ -83,7 +83,7 @@ python main.py backtest --start 2026-01-02 --end 2026-03-31
 
 Dates are UTC calendar days. `--end` defaults to today, so `--start 2026-06-01` runs from that day through now. The same two dates can sit in `config.yaml` as `backtest.start` and `backtest.end`. Flags on the command override the file.
 
-The download starts a week before `--start` so RSI and ATR already have bars on the first session. Trades open only inside the dates you asked for. A long window on the full watchlist takes a while, because every symbol is downloaded for that span. To try one name, set `symbols.stocks` to a short list, run the backtest, then put `watchlist` back.
+For 5-minute bars, the download starts seven calendar days before `--start` so RSI and ATR already have bars on the first session. Trades open only inside the dates you asked for. A long window on the full watchlist takes a while, because every symbol is downloaded for that span. To try one name, set `symbols.stocks` to a short list, run the backtest, then put `watchlist` back.
 
 `python main.py montecarlo` runs that same replay, then builds 2,000 equity curves by resampling the closed trades. It does not send orders and it does not invent new prices.
 
@@ -94,6 +94,45 @@ python main.py montecarlo --start 2026-01-02 --end 2026-03-31 --paths 2000 --see
 `pytest` runs the unit tests and does not call Alpaca.
 
 Settings, environment variables, and startup errors: [docs/CONFIGURATION.md](docs/CONFIGURATION.md).
+
+## How a command runs
+
+`status` prints the account. `report` is the command that builds metrics. The replay keeps its trades in memory and does not open the SQLite ledger. `montecarlo` runs that replay once, then resamples the closed-trade P&L. Only `run` sends orders.
+
+```mermaid
+flowchart TB
+  cmd["python main.py"]
+  cfg["config.yaml"] --> cmd
+  cmd --> status["status"]
+  cmd --> report["report"]
+  cmd --> bt["backtest"]
+  cmd --> mc["montecarlo"]
+  cmd --> run["run"]
+
+  status --> acct["Alpaca account, positions, and clock"]
+  status --> recent["recent closes from SQLite"]
+  status --> disp["display.py"]
+
+  report --> met["metrics.py"]
+  met --> sql["SQLite ledger"]
+  met --> hist["Alpaca portfolio history, unless --no-alpaca"]
+
+  bt --> bars["download bars, send no orders"]
+  mc --> bars
+  bars --> snap["snapshots.py"]
+  snap --> rules["strategy.py and sizing.py"]
+  rules --> mem["trades kept in memory for this run"]
+  mc --> resample["montecarlo.py resamples that run's P&Ls"]
+
+  run --> bot["bot.py"]
+  bot --> clock["market_hours.py gates stock scans"]
+  bot --> ind["strategy.py through indicators.py"]
+  bot --> sz["sizing.py"]
+  bot --> ord["Alpaca orders"]
+  bot --> book["SQLite ledger, reconciled to Alpaca on startup"]
+```
+
+`backtest` stops at the in-memory trades. The resample step runs only for `montecarlo`.
 
 ## Design
 
@@ -117,6 +156,7 @@ config.yaml    risk, watchlist, and the backtest window
 
 ## Limitations
 
+- The strategy was adjusted after an earlier run on this same window, so the results above are in-sample and likely optimistic, not an out-of-sample test.
 - The year replay above is +13.3% at +0.10R per trade. In the Monte Carlo, 20.8% of reshuffles of those same trades finish below the starting $10,000.
 - Fees and slippage are not modeled in the backtest.
 - Equity bars use Alpaca's IEX feed, which covers only a slice of total market volume, so volume signals reflect IEX prints only.

@@ -20,6 +20,7 @@ def test_resample_is_reproducible_and_centered_on_the_trades():
     assert first.n_trades == 4
     assert first.observed_ending == pytest.approx(1010.0)
     assert first.ending_p5 < first.ending_p50 < first.ending_p95
+    assert first.max_drawdown_p5 <= first.max_drawdown_p50 <= first.max_drawdown_p95
     assert 0.0 < first.probability_loss < 1.0
 
 

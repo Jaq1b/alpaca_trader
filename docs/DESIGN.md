@@ -16,7 +16,7 @@ Each choice below is the one in the code today.
 
 **Why:** A rotating slice of the whole market spent cycles on names that never scored. A liquid list that fits in one pass is what the loop actually watches.
 
-**Trade-off:** A cached close can be as old as `bars_ttl_seconds`. Names outside the watchlist are ignored until you list them or switch `symbols.stocks` to `top_N` or `all`.
+**Trade-off:** A cached close can be as old as `bars_ttl_seconds`. Names outside the watchlist are ignored until you list them or, on the live loop, switch `symbols.stocks` to `top_N` or `all`. A replay uses the watchlist or an explicit ticker list.
 
 ## ATR stop, then size from that distance
 
